@@ -95,3 +95,26 @@ func selectFamilyBlockingEngine(
 
 	return familyEngineNone
 }
+
+func selectSocketRuleBlockingEngine(
+	rules []seccompkg.SocketRule,
+	cfg *config.SandboxConfig,
+	caps *capabilities.SecurityCapabilities,
+) familyEngine {
+	if len(rules) == 0 {
+		return familyEngineNone
+	}
+
+	seccompAvailable := caps != nil && caps.Seccomp
+	if seccompAvailable && wrapperWillRun(cfg) {
+		return familyEngineSeccomp
+	}
+
+	ptraceAvailable := caps != nil && caps.Ptrace
+	ptraceEnabled := cfg != nil && cfg.Ptrace.Enabled
+	if ptraceAvailable && ptraceEnabled {
+		return familyEnginePtrace
+	}
+
+	return familyEngineNone
+}

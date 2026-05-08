@@ -494,6 +494,9 @@ type SandboxSeccompConfig struct {
 	// (opt-out). Populated via applyDefaults from
 	// seccomp.DefaultBlockedFamilies when nil.
 	BlockedSocketFamilies []SandboxSeccompSocketFamilyConfig `yaml:"blocked_socket_families"`
+	SocketRules           []SandboxSeccompSocketRuleConfig   `yaml:"socket_rules"`
+	MitigationSets        []string                           `yaml:"mitigation_sets"`
+	MitigationDirs        []string                           `yaml:"mitigation_dirs"`
 }
 
 // SandboxSeccompUnixConfig configures unix socket monitoring via seccomp.
@@ -530,6 +533,14 @@ type SandboxSeccompFileMonitorConfig struct {
 type SandboxSeccompSocketFamilyConfig struct {
 	Family string `yaml:"family"` // AF_* name or numeric string
 	Action string `yaml:"action"` // errno|kill|log|log_and_kill (defaults to errno)
+}
+
+type SandboxSeccompSocketRuleConfig struct {
+	Name     string `yaml:"name"`
+	Family   string `yaml:"family"`
+	Type     string `yaml:"type,omitempty"`
+	Protocol string `yaml:"protocol,omitempty"`
+	Action   string `yaml:"action"`
 }
 
 // FileMonitorBoolWithDefault returns the value of a *bool field, or defaultVal if nil.
@@ -1301,6 +1312,9 @@ func Load(path string) (*Config, error) {
 
 	// Expand environment variables in config content (e.g., $HOME, ${HOME})
 	expanded := os.ExpandEnv(string(b))
+	if err := rejectRemovedConfigKeys([]byte(expanded)); err != nil {
+		return nil, err
+	}
 
 	var cfg Config
 	// Pre-seed ptrace performance defaults before YAML unmarshal.
@@ -1320,6 +1334,46 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+func rejectRemovedConfigKeys(data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if yamlMappingPathExists(&root, "sandbox", "seccomp", "hardening_profiles") {
+		return fmt.Errorf("sandbox.seccomp.hardening_profiles has been removed; use sandbox.seccomp.mitigation_sets")
+	}
+	return nil
+}
+
+func yamlMappingPathExists(node *yaml.Node, path ...string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.DocumentNode {
+		if len(node.Content) == 0 {
+			return false
+		}
+		node = node.Content[0]
+	}
+	for _, want := range path {
+		if node == nil || node.Kind != yaml.MappingNode {
+			return false
+		}
+		var next *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == want {
+				next = node.Content[i+1]
+				break
+			}
+		}
+		if next == nil {
+			return false
+		}
+		node = next
+	}
+	return true
+}
+
 // LoadWithSource loads config from path and returns the config along with its source.
 // The source parameter indicates where this config path came from.
 func LoadWithSource(path string, source ConfigSource) (*Config, ConfigSource, error) {
@@ -1330,6 +1384,9 @@ func LoadWithSource(path string, source ConfigSource) (*Config, ConfigSource, er
 
 	// Expand environment variables in config content (e.g., $HOME, ${HOME})
 	expanded := os.ExpandEnv(string(b))
+	if err := rejectRemovedConfigKeys([]byte(expanded)); err != nil {
+		return nil, source, err
+	}
 
 	var cfg Config
 	// Pre-seed ptrace performance defaults before YAML unmarshal (same as Load).
@@ -2311,6 +2368,26 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("sandbox.seccomp.blocked_socket_families[%d].action: %q is not valid (allowed: errno, kill, log, log_and_kill)", i, e.Action)
 			}
 		}
+	}
+	effective, err := EffectiveSeccompRulesForConfig(cfg.Sandbox.Seccomp)
+	if err != nil {
+		return fmt.Errorf("sandbox.seccomp.%w", err)
+	}
+	if _, err := ResolveBlockedFamilies(effective.BlockedSocketFamilies); err != nil {
+		return fmt.Errorf("sandbox.seccomp.%w", err)
+	}
+	if _, err := resolveSocketRuleConfigs(effective.SocketRules); err != nil {
+		return fmt.Errorf("sandbox.seccomp.%w", err)
+	}
+	for _, loaded := range effective.LoadedMitigations {
+		slog.Info("seccomp mitigation loaded",
+			"id", loaded.ID,
+			"source", loaded.Source,
+			"path", loaded.Path,
+			"checksum", loaded.Checksum,
+			"socket_rules", loaded.SocketRules,
+			"blocked_socket_families", loaded.BlockedSocketFamilies,
+			"syscalls", loaded.Syscalls)
 	}
 	return nil
 }

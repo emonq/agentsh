@@ -16,7 +16,7 @@ import (
 )
 
 // ptraceFamilyEmitter adapts the API's event store/broker to the
-// ptrace.FamilyEmitter interface so family-block audit events reach the
+// ptrace.FamilyEmitter interface so ptrace socket audit events reach the
 // same sink as the seccomp engine's events.
 type ptraceFamilyEmitter struct {
 	store  eventStore
@@ -42,6 +42,7 @@ func (a *App) initPtraceTracer() {
 		// Even when ptrace is disabled, check if socket-family blocking is
 		// configured but has no enforcement engine available, and warn.
 		a.warnIfFamiliesOrphan()
+		a.warnIfSocketRulesOrphan()
 		return
 	}
 
@@ -69,7 +70,7 @@ func (a *App) initPtraceTracer() {
 		slog.Warn("initPtraceTracer: failed to resolve blocked_socket_families; socket-family blocking will not be enforced via ptrace",
 			"error", err)
 	} else {
-		families, _ := config.ResolveBlockedFamilies(a.cfg.Sandbox.Seccomp.BlockedSocketFamilies)
+		families, _ := config.ResolveEffectiveBlockedFamilies(a.cfg.Sandbox.Seccomp)
 		if familyChecker != nil {
 			slog.Info("socket-family blocking: wired FamilyChecker on ptrace tracer",
 				"families", len(families))
@@ -82,23 +83,34 @@ func (a *App) initPtraceTracer() {
 		}
 	}
 
+	socketRuleChecker, err := resolveSocketRuleCheckerForPtrace(a.cfg, emit)
+	if err != nil {
+		slog.Warn("initPtraceTracer: failed to resolve socket_rules; socket tuple rules will not be enforced via ptrace",
+			"error", err)
+	} else if socketRuleChecker != nil {
+		rules, _ := config.ResolveSocketRules(a.cfg.Sandbox.Seccomp)
+		slog.Info("socket tuple blocking: wired SocketRuleChecker on ptrace tracer",
+			"rules", len(rules))
+	}
+
 	tr := ptrace.NewTracer(ptrace.TracerConfig{
-		AttachMode:       cfg.AttachMode,
-		TraceExecve:      cfg.Trace.Execve,
-		TraceFile:        cfg.Trace.File,
-		TraceNetwork:     cfg.Trace.Network,
-		TraceSignal:      cfg.Trace.Signal,
-		MaskTracerPid:    false, // validation rejects non-"off" values for now
-		SeccompPrefilter: cfg.Performance.SeccompPrefilter,
-		ArgLevelFilter:   cfg.Performance.ArgLevelFilter,
-		MaxTracees:       cfg.Performance.MaxTracees,
-		MaxHoldMs:        cfg.Performance.MaxHoldMs,
-		OnAttachFailure:  cfg.OnAttachFailure,
-		ExecHandler:      router,
-		FileHandler:      router,
-		NetworkHandler:   router,
-		SignalHandler:    router,
-		FamilyChecker:    familyChecker,
+		AttachMode:        cfg.AttachMode,
+		TraceExecve:       cfg.Trace.Execve,
+		TraceFile:         cfg.Trace.File,
+		TraceNetwork:      cfg.Trace.Network,
+		TraceSignal:       cfg.Trace.Signal,
+		MaskTracerPid:     false, // validation rejects non-"off" values for now
+		SeccompPrefilter:  cfg.Performance.SeccompPrefilter,
+		ArgLevelFilter:    cfg.Performance.ArgLevelFilter,
+		MaxTracees:        cfg.Performance.MaxTracees,
+		MaxHoldMs:         cfg.Performance.MaxHoldMs,
+		OnAttachFailure:   cfg.OnAttachFailure,
+		ExecHandler:       router,
+		FileHandler:       router,
+		NetworkHandler:    router,
+		SignalHandler:     router,
+		SocketRuleChecker: socketRuleChecker,
+		FamilyChecker:     familyChecker,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -177,7 +189,7 @@ func (a *App) initPtraceTracer() {
 //
 // Extracted as a standalone function for testability.
 func resolveFamilyCheckerForPtrace(cfg *config.Config, emit ptrace.FamilyEmitter) (*ptrace.FamilyChecker, error) {
-	families, err := config.ResolveBlockedFamilies(cfg.Sandbox.Seccomp.BlockedSocketFamilies)
+	families, err := config.ResolveEffectiveBlockedFamilies(cfg.Sandbox.Seccomp)
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +197,20 @@ func resolveFamilyCheckerForPtrace(cfg *config.Config, emit ptrace.FamilyEmitter
 		return nil, nil
 	}
 	return ptrace.NewFamilyCheckerWithEmitter(families, emit), nil
+}
+
+// resolveSocketRuleCheckerForPtrace resolves socket tuple rules to install on
+// the ptrace tracer. Returns nil when no raw rules or mitigation set rules
+// are configured/effective.
+func resolveSocketRuleCheckerForPtrace(cfg *config.Config, emit ptrace.FamilyEmitter) (*ptrace.SocketRuleChecker, error) {
+	rules, err := config.ResolveSocketRules(cfg.Sandbox.Seccomp)
+	if err != nil {
+		return nil, err
+	}
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	return ptrace.NewSocketRuleCheckerWithEmitter(rules, emit), nil
 }
 
 // closePtraceTracer stops the ptrace tracer if running.
@@ -200,10 +226,7 @@ func (a *App) closePtraceTracer() {
 // Called from initPtraceTracer when ptrace is disabled, to cover the
 // case where seccomp is also absent.
 func (a *App) warnIfFamiliesOrphan() {
-	if len(a.cfg.Sandbox.Seccomp.BlockedSocketFamilies) == 0 {
-		return
-	}
-	families, err := config.ResolveBlockedFamilies(a.cfg.Sandbox.Seccomp.BlockedSocketFamilies)
+	families, err := config.ResolveEffectiveBlockedFamilies(a.cfg.Sandbox.Seccomp)
 	if err != nil || len(families) == 0 {
 		return
 	}
@@ -213,4 +236,29 @@ func (a *App) warnIfFamiliesOrphan() {
 			"(seccomp and ptrace both unavailable or disabled); families will not be blocked",
 			"families", len(families))
 	}
+}
+
+// warnIfSocketRulesOrphan emits a warning when socket tuple rules are
+// configured but neither seccomp nor ptrace is available/enabled.
+// Called from initPtraceTracer when ptrace is disabled, to cover the
+// case where seccomp is also absent or the wrapper will not run.
+func (a *App) warnIfSocketRulesOrphan() {
+	_ = a.warnIfSocketRulesOrphanWithCaps(capabilities.DetectSecurityCapabilities())
+}
+
+func (a *App) warnIfSocketRulesOrphanWithCaps(caps *capabilities.SecurityCapabilities) bool {
+	if a == nil || a.cfg == nil {
+		return false
+	}
+	rules, err := config.ResolveSocketRules(a.cfg.Sandbox.Seccomp)
+	if err != nil || len(rules) == 0 {
+		return false
+	}
+	if selectSocketRuleBlockingEngine(rules, &a.cfg.Sandbox, caps) != familyEngineNone {
+		return false
+	}
+	slog.Warn("socket tuple blocking is configured but no enforcement engine is available on this host "+
+		"(seccomp and ptrace both unavailable or disabled); socket rules will not be blocked",
+		"rules", len(rules))
+	return true
 }

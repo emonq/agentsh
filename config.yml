@@ -241,9 +241,14 @@ sandbox:
 
   # seccomp settings
   seccomp:
-    # Reserved for future hardening (not implemented yet).
+    # Linux seccomp-bpf enforcement for syscall, file, and socket filters.
     enabled: false
-    profile: "default"             # or path to custom profile
+    # Advisory mitigation sets. Built-ins are embedded in agentsh; external
+    # directories are optional and only requested IDs are loaded.
+    # mitigation_sets:
+    #   - dirtyfrag-conservative
+    # mitigation_dirs:
+    #   - /etc/agentsh/mitigations
     # File I/O interception via seccomp-notify.
     # When enabled, seccomp intercepts file syscalls (openat, unlinkat, etc.)
     # and evaluates them against the active policy's file_rules.

@@ -32,6 +32,7 @@ type Filter struct {
 	fd               seccomp.ScmpFd
 	blockList        map[uint32]seccompkg.OnBlockAction
 	blockedFamilyMap map[uint64]seccompkg.BlockedFamily
+	socketRules      []seccompkg.SocketRule
 }
 
 func (f *Filter) Close() error {
@@ -67,6 +68,15 @@ func (f *Filter) BlockedFamilyMap() map[uint64]seccompkg.BlockedFamily {
 		out[k] = v
 	}
 	return out
+}
+
+// SocketRules returns a copy of notify-mode socket tuple rules retained for
+// later notification dispatch. Kernel-only errno/kill rules are not included.
+func (f *Filter) SocketRules() []seccompkg.SocketRule {
+	if f == nil || len(f.socketRules) == 0 {
+		return nil
+	}
+	return cloneSocketRules(f.socketRules)
 }
 
 // InstallFilter installs a user-notify seccomp filter on the current process
@@ -239,6 +249,7 @@ type FilterConfig struct {
 	BlockIOUring       bool  // io_uring_setup/enter/register → EPERM
 	BlockedSyscalls    []int // syscall numbers to block; action controlled by OnBlockAction
 	BlockedFamilies    []seccompkg.BlockedFamily
+	SocketRules        []seccompkg.SocketRule
 	OnBlockAction      seccompkg.OnBlockAction
 }
 
@@ -400,6 +411,7 @@ func InstallFilterWithConfig(cfg FilterConfig) (*Filter, error) {
 	}
 	blockListMap := map[uint32]seccompkg.OnBlockAction{}
 	blockedFamilyMap := map[uint64]seccompkg.BlockedFamily{}
+	socketRules := []seccompkg.SocketRule{}
 	switch action {
 	case seccompkg.OnBlockErrno:
 		errnoAction := seccomp.ActErrno.SetReturnCode(int16(unix.EPERM))
@@ -423,6 +435,17 @@ func InstallFilterWithConfig(cfg FilterConfig) (*Filter, error) {
 		}
 	}
 	ruleCounts["blocked_syscalls"] = len(cfg.BlockedSyscalls)
+
+	// Per-socket tuple blocking on socket(2) and socketpair(2).
+	// These narrow family/type/protocol rules are installed before broad
+	// family-only rules so later dispatch can evaluate the most specific
+	// configured tuples first. Kernel action precedence still determines the
+	// result when actions differ, preserving existing blocked-family behavior.
+	socketRules, socketRulesAdded, err := installSocketRulesConditional(filt, cfg.SocketRules)
+	if err != nil {
+		return nil, err
+	}
+	ruleCounts["socket_rules"] = socketRulesAdded
 
 	// Per-socket-family blocking on socket(2) and socketpair(2).
 	// libseccomp action-precedence (KILL > TRAP > ERRNO > … > NOTIFY) ensures
@@ -503,12 +526,12 @@ func InstallFilterWithConfig(cfg FilterConfig) (*Filter, error) {
 	fd, err := filt.GetNotifFd()
 	if err != nil {
 		// If no notify rules, fd will be -1, which is fine
-		if !cfg.UnixSocketEnabled && !cfg.ExecveEnabled && !cfg.FileMonitorEnabled {
-			return &Filter{fd: -1, blockList: blockListMap, blockedFamilyMap: blockedFamilyMap}, nil
+		if !filterConfigNeedsNotifyFD(cfg, blockListMap, blockedFamilyMap, socketRules) {
+			return &Filter{fd: -1, blockList: blockListMap, blockedFamilyMap: blockedFamilyMap, socketRules: socketRules}, nil
 		}
 		return nil, err
 	}
-	return &Filter{fd: fd, blockList: blockListMap, blockedFamilyMap: blockedFamilyMap}, nil
+	return &Filter{fd: fd, blockList: blockListMap, blockedFamilyMap: blockedFamilyMap, socketRules: socketRules}, nil
 }
 
 // familyToScmpAction maps an OnBlockAction to the libseccomp action used
@@ -524,6 +547,129 @@ func familyToScmpAction(a seccompkg.OnBlockAction) (seccomp.ScmpAction, error) {
 	default:
 		return seccomp.ActAllow, fmt.Errorf("unknown family block action %q", a)
 	}
+}
+
+type conditionalRuleAdder interface {
+	AddRuleConditional(seccomp.ScmpSyscall, seccomp.ScmpAction, []seccomp.ScmpCondition) error
+}
+
+func installSocketRulesConditional(adder conditionalRuleAdder, rules []seccompkg.SocketRule) ([]seccompkg.SocketRule, int, error) {
+	retained := []seccompkg.SocketRule{}
+	rulesAdded := 0
+	for _, rule := range rules {
+		action, err := familyToScmpAction(rule.Action)
+		if err != nil {
+			slog.Warn("seccomp: skipping socket rule with unknown action",
+				"rule", rule.Name, "family", rule.FamilyName, "action", rule.Action, "error", err)
+			continue
+		}
+		added, addErr := installSocketRuleConditional(adder, rule, action)
+		rulesAdded += added
+		if addErr != nil {
+			if added > 0 {
+				return nil, rulesAdded, fmt.Errorf("partial socket rule install for %q: %w", rule.Name, addErr)
+			}
+			return nil, rulesAdded, fmt.Errorf("add socket rule %q: %w", rule.Name, addErr)
+		}
+		if socketRuleUsesNotify(rule) {
+			retained = append(retained, cloneSocketRule(rule))
+		}
+	}
+	if len(retained) == 0 {
+		return nil, rulesAdded, nil
+	}
+	return retained, rulesAdded, nil
+}
+
+func installSocketRuleConditional(adder conditionalRuleAdder, rule seccompkg.SocketRule, action seccomp.ScmpAction) (int, error) {
+	conditions := socketRuleConditions(rule)
+	added := 0
+	for _, sc := range []int{unix.SYS_SOCKET, unix.SYS_SOCKETPAIR} {
+		if err := adder.AddRuleConditional(seccomp.ScmpSyscall(sc), action, conditions); err != nil {
+			return added, fmt.Errorf("add conditional rule for syscall %d: %w", sc, err)
+		}
+		added++
+	}
+	return added, nil
+}
+
+func socketRuleConditions(rule seccompkg.SocketRule) []seccomp.ScmpCondition {
+	conditions := []seccomp.ScmpCondition{
+		{
+			Argument: 0,
+			Op:       seccomp.CompareEqual,
+			Operand1: uint64(rule.Family),
+		},
+	}
+	if rule.Type != nil {
+		conditions = append(conditions, seccomp.ScmpCondition{
+			Argument: 1,
+			Op:       seccomp.CompareMaskedEqual,
+			Operand1: uint64(seccompkg.SocketTypeMask),
+			Operand2: uint64(*rule.Type),
+		})
+	}
+	if rule.Protocol != nil {
+		conditions = append(conditions, seccomp.ScmpCondition{
+			Argument: 2,
+			Op:       seccomp.CompareEqual,
+			Operand1: uint64(*rule.Protocol),
+		})
+	}
+	return conditions
+}
+
+func notifySocketRules(rules []seccompkg.SocketRule) []seccompkg.SocketRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]seccompkg.SocketRule, 0, len(rules))
+	for _, rule := range rules {
+		if socketRuleUsesNotify(rule) {
+			out = append(out, cloneSocketRule(rule))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func socketRuleUsesNotify(rule seccompkg.SocketRule) bool {
+	return rule.Action == seccompkg.OnBlockLog || rule.Action == seccompkg.OnBlockLogAndKill
+}
+
+func cloneSocketRules(rules []seccompkg.SocketRule) []seccompkg.SocketRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]seccompkg.SocketRule, len(rules))
+	for i, rule := range rules {
+		out[i] = cloneSocketRule(rule)
+	}
+	return out
+}
+
+func cloneSocketRule(rule seccompkg.SocketRule) seccompkg.SocketRule {
+	if rule.Type != nil {
+		typ := *rule.Type
+		rule.Type = &typ
+	}
+	if rule.Protocol != nil {
+		protocol := *rule.Protocol
+		rule.Protocol = &protocol
+	}
+	return rule
+}
+
+func filterConfigNeedsNotifyFD(cfg FilterConfig, blockListMap map[uint32]seccompkg.OnBlockAction, blockedFamilyMap map[uint64]seccompkg.BlockedFamily, socketRules []seccompkg.SocketRule) bool {
+	return cfg.UnixSocketEnabled ||
+		cfg.ExecveEnabled ||
+		cfg.FileMonitorEnabled ||
+		cfg.InterceptMetadata ||
+		len(blockListMap) > 0 ||
+		len(blockedFamilyMap) > 0 ||
+		len(socketRules) > 0
 }
 
 // loadWithRetryOnWaitKillFailure loads a seccomp filter and, if the load
@@ -722,6 +868,7 @@ func filterDiagnosticFields(filt *seccomp.ScmpFilter, cfg FilterConfig, waitKill
 		"rules_metadata", ruleCounts["metadata"],
 		"rules_blocked_syscalls", ruleCounts["blocked_syscalls"],
 		"rules_blocked_families", ruleCounts["blocked_families"],
+		"rules_socket_rules", ruleCounts["socket_rules"],
 		"rules_io_uring_block", ruleCounts["io_uring_block"],
 		"cfg_unix_socket_enabled", cfg.UnixSocketEnabled,
 		"cfg_execve_enabled", cfg.ExecveEnabled,

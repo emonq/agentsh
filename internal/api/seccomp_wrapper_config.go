@@ -19,6 +19,7 @@ type seccompWrapperConfig struct {
 	FileMonitorEnabled  bool                      `json:"file_monitor_enabled"`
 	BlockedSyscalls     []string                  `json:"blocked_syscalls"`
 	BlockedFamilies     []seccompkg.BlockedFamily `json:"blocked_families,omitempty"`
+	SocketRules         []seccompkg.SocketRule    `json:"socket_rules,omitempty"`
 	OnBlock             string                    `json:"on_block,omitempty"`
 
 	// File monitor sub-options
@@ -47,25 +48,32 @@ type seccompWrapperParams struct {
 }
 
 func (a *App) buildSeccompWrapperConfig(s *session.Session, p seccompWrapperParams) seccompWrapperConfig {
+	blockedSyscalls, onBlock, err := config.EffectiveSyscallBlock(a.cfg.Sandbox.Seccomp)
+	if err != nil {
+		slog.Warn("seccomp: failed to resolve effective syscall block list; syscall rules will not be blocked", "error", err)
+	}
 	seccompCfg := seccompWrapperConfig{
 		UnixSocketEnabled:   p.UnixSocketEnabled,
 		SignalFilterEnabled: p.SignalFilterEnabled,
 		ExecveEnabled:       p.ExecveEnabled,
 		FileMonitorEnabled:  config.FileMonitorBoolWithDefault(a.cfg.Sandbox.Seccomp.FileMonitor.Enabled, false),
-		BlockedSyscalls:     a.cfg.Sandbox.Seccomp.Syscalls.Block,
-		OnBlock:             a.cfg.Sandbox.Seccomp.Syscalls.OnBlock,
+		BlockedSyscalls:     blockedSyscalls,
+		OnBlock:             onBlock,
 		ServerPID:           os.Getpid(),
 	}
 
 	// Resolve and forward blocked socket families.
-	if len(a.cfg.Sandbox.Seccomp.BlockedSocketFamilies) > 0 {
-		families, err := config.ResolveBlockedFamilies(a.cfg.Sandbox.Seccomp.BlockedSocketFamilies)
-		if err != nil {
-			slog.Warn("seccomp: failed to resolve blocked_socket_families; families will not be blocked",
-				"error", err)
-		} else {
-			seccompCfg.BlockedFamilies = families
-		}
+	families, err := config.ResolveEffectiveBlockedFamilies(a.cfg.Sandbox.Seccomp)
+	if err != nil {
+		slog.Warn("seccomp: failed to resolve blocked_socket_families; families will not be blocked", "error", err)
+	} else {
+		seccompCfg.BlockedFamilies = families
+	}
+
+	if rules, err := config.ResolveSocketRules(a.cfg.Sandbox.Seccomp); err != nil {
+		slog.Warn("seccomp: failed to resolve socket_rules; socket rules will not be blocked", "error", err)
+	} else {
+		seccompCfg.SocketRules = rules
 	}
 
 	fmDefault := config.FileMonitorBoolWithDefault(a.cfg.Sandbox.Seccomp.FileMonitor.EnforceWithoutFUSE, false)
