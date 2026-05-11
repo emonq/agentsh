@@ -43,3 +43,63 @@ func TestBackend_EmptyInputReturnsEmpty(t *testing.T) {
 		t.Fatalf("empty SQL should produce no statements, got %d", len(got))
 	}
 }
+
+func TestParser_SourceSpan_Single(t *testing.T) {
+	p := New(DialectPostgres)
+	sql := "SELECT 1"
+	got, err := p.Classify(sql, SessionState{}, Options{})
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d want 1", len(got))
+	}
+	if got[0].SourceStart != 0 {
+		t.Fatalf("SourceStart=%d want 0", got[0].SourceStart)
+	}
+	if got[0].SourceEnd != int32(len(sql)) {
+		t.Fatalf("SourceEnd=%d want %d", got[0].SourceEnd, len(sql))
+	}
+}
+
+func TestParser_SourceSpan_MultiStmt(t *testing.T) {
+	p := New(DialectPostgres)
+	sql := "SELECT 1; SELECT 2"
+	got, err := p.Classify(sql, SessionState{}, Options{})
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+	if string(sql[got[0].SourceStart:got[0].SourceEnd]) != "SELECT 1" {
+		t.Fatalf("stmt[0] span = %q want %q",
+			string(sql[got[0].SourceStart:got[0].SourceEnd]), "SELECT 1")
+	}
+	if string(sql[got[1].SourceStart:got[1].SourceEnd]) != "SELECT 2" {
+		t.Fatalf("stmt[1] span = %q want %q",
+			string(sql[got[1].SourceStart:got[1].SourceEnd]), "SELECT 2")
+	}
+}
+
+func TestParser_SourceSpan_TrailingStmtNoSemicolon(t *testing.T) {
+	// Single statement with no trailing semicolon — libpg_query reports
+	// StmtLen=0 for trailing single statements; classifyWithBackend must
+	// extend SourceEnd to len(sql).
+	p := New(DialectPostgres)
+	sql := "SELECT 1"
+	got, err := p.Classify(sql, SessionState{}, Options{})
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d want 1", len(got))
+	}
+	if got[0].SourceEnd != int32(len(sql)) {
+		t.Fatalf("SourceEnd=%d want %d (StmtLen=0 must extend to end)",
+			got[0].SourceEnd, len(sql))
+	}
+	if got[0].SourceStart != 0 {
+		t.Fatalf("SourceStart=%d want 0", got[0].SourceStart)
+	}
+}

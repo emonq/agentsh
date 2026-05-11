@@ -4,12 +4,14 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/agentsh/agentsh/internal/db/events"
+	"github.com/agentsh/agentsh/internal/db/policy"
 )
 
 // connState is the per-connection state carried through the 04b handshake.
@@ -47,6 +49,11 @@ type connState struct {
 	// state via an explicit opt-in (replication_passthrough in 04b₂;
 	// gssenc_passthrough lands in Plan 05). Used by the DVW emitter.
 	degradedReason string
+
+	// Task 6 captures from forwardAuth.
+	lastUpstreamRFQ byte                 // 'I' | 'T' | 'E' | 0 (pre-auth)
+	redactionTier   policy.RedactionTier // resolved at handshake end
+	tlsMode         string               // svc.TLSMode at handshake end, for EventTLS.Mode
 }
 
 // logger narrows *slog.Logger to just the methods we use, so tests can
@@ -157,4 +164,42 @@ func (pc *proxyConn) emitDegradedVisibility(ctx context.Context, degradedReason,
 		SNIHostname:    pc.state.sniHostname,
 	}
 	_ = pc.srv.cfg.Sink.EmitLifecycle(ctx, ev)
+}
+
+// emitFrameTooLarge emits a db_handshake_fail event with error_code
+// FRAME_TOO_LARGE. Used when the client sends a 'Q' body above MaxQueryBytes.
+func (pc *proxyConn) emitFrameTooLarge(ctx context.Context, size int) {
+	if pc.srv.cfg.Sink == nil {
+		return
+	}
+	_ = pc.srv.cfg.Sink.EmitLifecycle(ctx, events.LifecycleEvent{
+		EventID:        newEventID(),
+		Timestamp:      timeNow(),
+		DBService:      pc.svc.Name,
+		ClientIdentity: pc.state.clientIdentity,
+		Kind:           "db_handshake_fail",
+		ErrorCode:      "FRAME_TOO_LARGE",
+		Reason:         fmt.Sprintf("statement too large for AgentSH proxy: %d bytes > %d cap", size, pc.srv.cfg.MaxQueryBytes),
+		PeerUID:        pc.state.peerUID,
+	})
+}
+
+// emitUnsupportedFrame emits a db_handshake_fail event when the client sends
+// a Plan-05 frame (Parse/Bind/Describe/Execute/Sync/Flush/Close/FunctionCall)
+// post-handshake. errorCode distinguishes FUNCTION_CALL_PROTOCOL_DENIED from
+// the generic EXTENDED_QUERY_NOT_SUPPORTED.
+func (pc *proxyConn) emitUnsupportedFrame(ctx context.Context, errorCode, frameType string) {
+	if pc.srv.cfg.Sink == nil {
+		return
+	}
+	_ = pc.srv.cfg.Sink.EmitLifecycle(ctx, events.LifecycleEvent{
+		EventID:        newEventID(),
+		Timestamp:      timeNow(),
+		DBService:      pc.svc.Name,
+		ClientIdentity: pc.state.clientIdentity,
+		Kind:           "db_handshake_fail",
+		ErrorCode:      errorCode,
+		Reason:         "frame " + frameType + " not supported in AgentSH proxy phase 1",
+		PeerUID:        pc.state.peerUID,
+	})
 }

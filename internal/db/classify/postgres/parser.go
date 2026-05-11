@@ -7,6 +7,8 @@ package postgres
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 
@@ -101,6 +103,10 @@ func (s SessionState) Clone() SessionState {
 // Parser is the single public surface. Implementations are returned by New.
 type Parser interface {
 	Classify(sql string, sess SessionState, opts Options) ([]effects.ClassifiedStatement, error)
+	// Normalize returns SQL with all literal values replaced by $N placeholders.
+	// On parse failure returns the parser error verbatim; callers degrade to
+	// the verbatim trimmed SQL for digest computation.
+	Normalize(sql string) (string, error)
 }
 
 // New returns the parser for the given dialect, using whichever libpg_query
@@ -160,6 +166,29 @@ func classifyWithBackend(
 	out := make([]effects.ClassifiedStatement, 0, len(res.Stmts))
 	for _, raw := range res.Stmts {
 		cs := classifyRawStmt(dialect, raw, sess, opts, backend)
+		// pg_query gives StmtLen=0 for a trailing single statement; in that
+		// case the statement runs from StmtLocation to end-of-input.
+		start := raw.StmtLocation
+		length := raw.StmtLen
+		var end int32
+		if length == 0 {
+			end = int32(len(sql))
+		} else {
+			end = start + length
+		}
+		// Skip leading whitespace to get the actual statement boundaries.
+		// libpg_query's StmtLocation can point at a separator's trailing
+		// whitespace in multi-statement input. Use utf8.DecodeRuneInString
+		// so multi-byte whitespace (e.g. U+00A0) is handled correctly.
+		for start < end {
+			r, width := utf8.DecodeRuneInString(sql[int(start):])
+			if !unicode.IsSpace(r) {
+				break
+			}
+			start += int32(width)
+		}
+		cs.SourceStart = start
+		cs.SourceEnd = end
 		out = append(out, cs)
 	}
 	return out, nil
