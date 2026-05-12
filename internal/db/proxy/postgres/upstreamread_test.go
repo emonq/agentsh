@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/agentsh/agentsh/internal/db/proxy/postgres/statemachine"
 )
 
 func TestParseCommandTag(t *testing.T) {
@@ -78,7 +80,7 @@ func upstreamReadFixture(t *testing.T) (pc *proxyConn, scriptUpstream func([]pgp
 
 func TestForwardUpstreamUntilRFQ_HappyPath(t *testing.T) {
 	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
-	pc.state.lastUpstreamRFQ = 'I'
+	pc.state.smState.LastUpstreamRFQ = 'I'
 
 	// Drain client side so backend writes from forwardUpstreamUntilRFQ unblock.
 	drained := make(chan struct{})
@@ -114,14 +116,14 @@ func TestForwardUpstreamUntilRFQ_HappyPath(t *testing.T) {
 	if r.ErrorCode != "" {
 		t.Fatalf("ErrorCode = %q want empty", r.ErrorCode)
 	}
-	if pc.state.lastUpstreamRFQ != 'I' {
-		t.Fatalf("lastUpstreamRFQ = %q want 'I'", pc.state.lastUpstreamRFQ)
+	if pc.state.smState.LastUpstreamRFQ != 'I' {
+		t.Fatalf("lastUpstreamRFQ = %q want 'I'", pc.state.smState.LastUpstreamRFQ)
 	}
 }
 
 func TestForwardUpstreamUntilRFQ_MultiStmt(t *testing.T) {
 	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
-	pc.state.lastUpstreamRFQ = 'I'
+	pc.state.smState.LastUpstreamRFQ = 'I'
 
 	go func() {
 		for {
@@ -152,14 +154,14 @@ func TestForwardUpstreamUntilRFQ_MultiStmt(t *testing.T) {
 	if r.AffectedByStmt[1] == nil || *r.AffectedByStmt[1] != 5 {
 		t.Fatalf("AffectedByStmt[1] = %v want 5", r.AffectedByStmt[1])
 	}
-	if pc.state.lastUpstreamRFQ != 'T' {
-		t.Fatalf("lastUpstreamRFQ = %q want 'T'", pc.state.lastUpstreamRFQ)
+	if pc.state.smState.LastUpstreamRFQ != 'T' {
+		t.Fatalf("lastUpstreamRFQ = %q want 'T'", pc.state.smState.LastUpstreamRFQ)
 	}
 }
 
 func TestForwardUpstreamUntilRFQ_MidBatchError(t *testing.T) {
 	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
-	pc.state.lastUpstreamRFQ = 'I'
+	pc.state.smState.LastUpstreamRFQ = 'I'
 
 	go func() {
 		for {
@@ -184,7 +186,100 @@ func TestForwardUpstreamUntilRFQ_MidBatchError(t *testing.T) {
 	if r.ErrorCode != "23505" {
 		t.Fatalf("ErrorCode = %q want 23505", r.ErrorCode)
 	}
-	if pc.state.lastUpstreamRFQ != 'E' {
-		t.Fatalf("lastUpstreamRFQ = %q want 'E'", pc.state.lastUpstreamRFQ)
+	if pc.state.smState.LastUpstreamRFQ != 'E' {
+		t.Fatalf("lastUpstreamRFQ = %q want 'E'", pc.state.smState.LastUpstreamRFQ)
+	}
+}
+
+func TestForwardUpstream_TracksTxStartedAt(t *testing.T) {
+	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
+	pc.state.smState = &statemachine.ConnState{LastUpstreamRFQ: 'I'}
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			if _, err := clientFE.Receive(); err != nil {
+				return
+			}
+		}
+	}()
+
+	scriptUpstream([]pgproto3.BackendMessage{
+		&pgproto3.ReadyForQuery{TxStatus: 'T'},
+	})
+	if _, err := pc.forwardUpstreamUntilRFQ(context.Background(), time.Now(), 0); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if pc.state.smState.LastUpstreamRFQ != 'T' {
+		t.Errorf("LastUpstreamRFQ=%q want 'T'", pc.state.smState.LastUpstreamRFQ)
+	}
+	if pc.state.smState.TxStartedAt.IsZero() {
+		t.Error("TxStartedAt should be populated on I→T transition")
+	}
+	if pc.state.smState.Phase != statemachine.PhaseInTx {
+		t.Errorf("Phase=%v want PhaseInTx", pc.state.smState.Phase)
+	}
+}
+
+func TestForwardUpstream_TxStartedAt_PreservedOnTtoT(t *testing.T) {
+	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
+	preserved := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	pc.state.smState = &statemachine.ConnState{
+		LastUpstreamRFQ: 'T',
+		Phase:           statemachine.PhaseInTx,
+		TxStartedAt:     preserved,
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			if _, err := clientFE.Receive(); err != nil {
+				return
+			}
+		}
+	}()
+
+	scriptUpstream([]pgproto3.BackendMessage{
+		&pgproto3.ReadyForQuery{TxStatus: 'T'},
+	})
+	if _, err := pc.forwardUpstreamUntilRFQ(context.Background(), time.Now(), 0); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if !pc.state.smState.TxStartedAt.Equal(preserved) {
+		t.Errorf("TxStartedAt drifted on T→T: got %v want %v", pc.state.smState.TxStartedAt, preserved)
+	}
+}
+
+func TestForwardUpstream_TxStartedAt_ClearedOnReturnToIdle(t *testing.T) {
+	pc, scriptUpstream, clientFE := upstreamReadFixture(t)
+	pc.state.smState = &statemachine.ConnState{
+		LastUpstreamRFQ: 'T',
+		Phase:           statemachine.PhaseInTx,
+		TxStartedAt:     time.Now(),
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			if _, err := clientFE.Receive(); err != nil {
+				return
+			}
+		}
+	}()
+
+	scriptUpstream([]pgproto3.BackendMessage{
+		&pgproto3.ReadyForQuery{TxStatus: 'I'},
+	})
+	if _, err := pc.forwardUpstreamUntilRFQ(context.Background(), time.Now(), 0); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if !pc.state.smState.TxStartedAt.IsZero() {
+		t.Error("TxStartedAt should be cleared on T→I transition")
+	}
+	if pc.state.smState.Phase != statemachine.PhaseIdle {
+		t.Errorf("Phase=%v want PhaseIdle", pc.state.smState.Phase)
 	}
 }

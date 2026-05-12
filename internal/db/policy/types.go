@@ -85,7 +85,6 @@ type DBService struct {
 	Dialect                   string `yaml:"dialect"`
 	Upstream                  string `yaml:"upstream"`
 	TLSMode                   string `yaml:"tls_mode"`
-	DenyModeInTx              string `yaml:"deny_mode_in_tx,omitempty"`
 	AllowFunctionCallProtocol bool   `yaml:"allow_function_call_protocol,omitempty"`
 	AllowGSSEncryption        bool   `yaml:"allow_gss_encryption,omitempty"`
 	TrustedNetwork            bool   `yaml:"trusted_network,omitempty"`
@@ -106,6 +105,7 @@ type StatementRule struct {
 	Message                     string        `yaml:"message,omitempty"`
 	Timeout                     time.Duration `yaml:"timeout,omitempty"`
 	AcknowledgeAuditOnDangerous bool          `yaml:"acknowledge_audit_on_dangerous,omitempty"`
+	DenyModeInTx                string        `yaml:"deny_mode_in_tx,omitempty"`
 }
 
 // ConnectionRule is the on-disk shape of a database_connection_rules entry per §9.3.
@@ -210,6 +210,23 @@ func (rs *RuleSet) AllServices() []DBService {
 	out := make([]DBService, 0, len(rs.services))
 	for _, s := range rs.services {
 		out = append(out, *s)
+	}
+	return out
+}
+
+// AllStatementRules returns a copy of every parsed StatementRule. Order is
+// preserved from the source YAML. Returns nil when rs is nil. Used by the
+// Extended Query state machine to look up the deny_mode_in_tx field for a
+// matched rule.
+func (rs *RuleSet) AllStatementRules() []StatementRule {
+	if rs == nil || len(rs.statement) == 0 {
+		return nil
+	}
+	out := make([]StatementRule, 0, len(rs.statement))
+	for _, cr := range rs.statement {
+		if cr.src != nil {
+			out = append(out, *cr.src)
+		}
 	}
 	return out
 }
