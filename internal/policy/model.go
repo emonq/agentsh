@@ -10,9 +10,10 @@ import (
 )
 
 type Policy struct {
-	Version     int    `yaml:"version"`
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
+	Version     int            `yaml:"version"`
+	Name        string         `yaml:"name"`
+	Description string         `yaml:"description"`
+	Metadata    []RuleMetadata `yaml:"metadata,omitempty"`
 
 	FileRules            []FileRule            `yaml:"file_rules"`
 	NetworkRules         []NetworkRule         `yaml:"network_rules"`
@@ -65,6 +66,17 @@ type Policy struct {
 	// (e.g. policies.db is owned by internal/db/policy). Each sub-package
 	// reads its own slice via yaml.Marshal/Unmarshal round-trip.
 	Policies yaml.Node `yaml:"policies,omitempty"`
+}
+
+// RuleMetadata is non-enforcing metadata attached to generated policy rules.
+// The policy engine ignores it for decisions; consumers use it to correlate
+// generic rule names back to higher-level generated bundles.
+type RuleMetadata struct {
+	RuleName    string `yaml:"rule_name"`
+	Source      string `yaml:"source"`
+	DBService   string `yaml:"db_service,omitempty"`
+	BypassMode  string `yaml:"bypass_mode,omitempty"`
+	Destination string `yaml:"destination,omitempty"`
 }
 
 type FileRule struct {
@@ -188,15 +200,19 @@ type DnsRedirectRule struct {
 	OnFailure  string `yaml:"on_failure,omitempty"` // fail_closed, fail_open, retry_original
 }
 
-// ConnectRedirectRule redirects TCP connections for matching host:port
+// ConnectRedirectRule redirects TCP connections for matching host:port.
+// Exactly one target must be set:
+//   - redirect_to for TCP host:port targets
+//   - redirect_to_unix for Unix-socket targets
 type ConnectRedirectRule struct {
-	Name       string                    `yaml:"name"`
-	Match      string                    `yaml:"match"`       // regex pattern for host:port
-	RedirectTo string                    `yaml:"redirect_to"` // new host:port destination
-	TLS        *ConnectRedirectTLSConfig `yaml:"tls,omitempty"`
-	Visibility string                    `yaml:"visibility,omitempty"` // silent, audit_only, warn
-	Message    string                    `yaml:"message,omitempty"`
-	OnFailure  string                    `yaml:"on_failure,omitempty"` // fail_closed, fail_open, retry_original
+	Name           string                    `yaml:"name"`
+	Match          string                    `yaml:"match"` // regex pattern for host:port
+	RedirectTo     string                    `yaml:"redirect_to,omitempty"`
+	RedirectToUnix string                    `yaml:"redirect_to_unix,omitempty"`
+	TLS            *ConnectRedirectTLSConfig `yaml:"tls,omitempty"`
+	Visibility     string                    `yaml:"visibility,omitempty"` // silent, audit_only, warn
+	Message        string                    `yaml:"message,omitempty"`
+	OnFailure      string                    `yaml:"on_failure,omitempty"` // fail_closed, fail_open, retry_original
 }
 
 // ConnectRedirectTLSConfig controls TLS handling for connect redirects
@@ -466,6 +482,15 @@ func (p Policy) Validate() error {
 		return fmt.Errorf("name is required")
 	}
 
+	for i, m := range p.Metadata {
+		if m.RuleName == "" {
+			return fmt.Errorf("metadata[%d]: rule_name is required", i)
+		}
+		if m.Source == "" {
+			return fmt.Errorf("metadata[%d]: source is required", i)
+		}
+	}
+
 	// Validate DNS redirect rules
 	for i, r := range p.DnsRedirectRules {
 		if r.Name == "" {
@@ -509,8 +534,15 @@ func (p Policy) Validate() error {
 		if _, err := regexp.Compile(r.Match); err != nil {
 			return fmt.Errorf("connect_redirects[%d]: invalid match regex: %w", i, err)
 		}
-		if r.RedirectTo == "" {
-			return fmt.Errorf("connect_redirects[%d]: redirect_to is required", i)
+		targets := 0
+		if r.RedirectTo != "" {
+			targets++
+		}
+		if r.RedirectToUnix != "" {
+			targets++
+		}
+		if targets != 1 {
+			return fmt.Errorf("connect_redirects[%d]: exactly one of redirect_to or redirect_to_unix is required", i)
 		}
 		if r.TLS != nil {
 			if r.TLS.Mode != "" && r.TLS.Mode != "passthrough" && r.TLS.Mode != "rewrite_sni" {
