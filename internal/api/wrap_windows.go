@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -40,12 +41,25 @@ func recvFDFromConn(sock *os.File) (*os.File, error) {
 	return nil, fmt.Errorf("SCM_RIGHTS not available on Windows")
 }
 
-func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session) {
+func recvNotifyFDForWrap(conn *net.UnixConn) (*os.File, wrapNotifyMetadata, bool, error) {
+	return nil, wrapNotifyMetadata{}, false, errWrapNotSupported
+}
+
+func writeNotifyStatusForWrap(w io.Writer, ok bool) error {
+	return errWrapNotSupported
+}
+
+func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session, cleanup func() error) error {
 	// Not used on Windows — the driver handles exec interception directly.
+	return nil
 }
 
 func getConnPeerCreds(conn *net.UnixConn) peerCreds {
 	return peerCreds{}
+}
+
+func validateWrapperPIDForNotify(wrapperPID, peerPID int, peerUID uint32) error {
+	return nil
 }
 
 func (a *App) acceptPtracePID(ctx context.Context, listener net.Listener, socketPath string, sessionID string, expectedUID int) {

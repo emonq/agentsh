@@ -101,6 +101,7 @@ func runWrap(ctx context.Context, cfg *clientConfig, opts wrapOptions) error {
 	}
 	sessID := sess.ID
 	workspaceMount := sess.WorkspaceMount
+	networkProxyURL := sess.ProxyURL
 	llmProxyURL := sess.LLMProxyURL
 	if opts.sessionID == "" {
 		fmt.Fprintf(os.Stderr, "agentsh: session %s created (policy: %s)\n", sessID, opts.policy)
@@ -149,6 +150,8 @@ func runWrap(ctx context.Context, cfg *clientConfig, opts wrapOptions) error {
 		agentProc.Stderr = os.Stderr
 		agentProc.Env = buildWrapEnv(os.Environ(), sessID, cfg.serverAddr, false)
 	}
+
+	agentProc.Env = appendWrapNetworkProxyEnv(agentProc.Env, networkProxyURL)
 
 	// If FUSE mount is active, add it to the environment and set the working
 	// directory so the child process starts inside the mount. This ensures even
@@ -230,7 +233,7 @@ func runWrap(ctx context.Context, cfg *clientConfig, opts wrapOptions) error {
 		fmt.Fprintf(os.Stderr, "agentsh: agent %s started with %s interception (pid: %d)\n", opts.agentCmd, mechanism, agentProc.Process.Pid)
 		// Forward the notify fd to the server in the background
 		if wrapCfg.postStart != nil {
-			go wrapCfg.postStart()
+			go wrapCfg.postStart(agentProc.Process.Pid)
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "agentsh: agent %s started (pid: %d)\n", opts.agentCmd, agentProc.Process.Pid)
@@ -278,9 +281,9 @@ type wrapLaunchConfig struct {
 	env         []string
 	extraFiles  []*os.File
 	sysProcAttr *syscall.SysProcAttr
-	postStart   func()    // Called after the process starts (e.g., to forward notify fd)
-	postWait    func()    // Called after the process exits (e.g., to reclaim terminal)
-	keepAlive   io.Closer // Held open during shell lifetime (e.g., ptrace handshake conn)
+	postStart   func(childPID int) // Called after process start to forward notify fd with child PID
+	postWait    func()             // Called after the process exits (e.g., to reclaim terminal)
+	keepAlive   io.Closer          // Held open during shell lifetime (e.g., ptrace handshake conn)
 	// ptracePostStart is called after the child is started with the child PID.
 	// It performs the ptrace handshake (send PID, wait for ACK).
 	ptracePostStart func(childPID int) error
@@ -339,6 +342,77 @@ func buildWrapEnv(base []string, sessionID string, serverAddr string, bypassShel
 		env = append(env, "AGENTSH_IN_SESSION=1")
 	}
 	return env
+}
+
+func appendWrapNetworkProxyEnv(base []string, proxyURL string) []string {
+	if strings.TrimSpace(proxyURL) == "" {
+		return base
+	}
+
+	const noProxyDefault = "localhost,127.0.0.1"
+	proxyKeys := map[string]struct{}{
+		"HTTP_PROXY":  {},
+		"HTTPS_PROXY": {},
+		"ALL_PROXY":   {},
+		"http_proxy":  {},
+		"https_proxy": {},
+		"all_proxy":   {},
+		"NO_PROXY":    {},
+		"no_proxy":    {},
+	}
+
+	out := make([]string, 0, len(base)+8)
+	noProxyTokens := make([]string, 0)
+	noProxySeen := map[string]struct{}{}
+	for _, e := range base {
+		key, val, found := strings.Cut(e, "=")
+		if !found {
+			out = append(out, e)
+			continue
+		}
+		if strings.EqualFold(key, "NO_PROXY") {
+			for _, token := range strings.Split(val, ",") {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					continue
+				}
+				if _, ok := noProxySeen[token]; ok {
+					continue
+				}
+				noProxySeen[token] = struct{}{}
+				noProxyTokens = append(noProxyTokens, token)
+			}
+			continue
+		}
+		if _, ok := proxyKeys[key]; ok {
+			continue
+		}
+		out = append(out, e)
+	}
+
+	if len(noProxyTokens) == 0 {
+		noProxyTokens = strings.Split(noProxyDefault, ",")
+	} else {
+		if _, ok := noProxySeen["localhost"]; !ok {
+			noProxyTokens = append(noProxyTokens, "localhost")
+		}
+		if _, ok := noProxySeen["127.0.0.1"]; !ok {
+			noProxyTokens = append(noProxyTokens, "127.0.0.1")
+		}
+	}
+	noProxy := strings.Join(noProxyTokens, ",")
+
+	out = append(out,
+		fmt.Sprintf("HTTP_PROXY=%s", proxyURL),
+		fmt.Sprintf("HTTPS_PROXY=%s", proxyURL),
+		fmt.Sprintf("ALL_PROXY=%s", proxyURL),
+		fmt.Sprintf("http_proxy=%s", proxyURL),
+		fmt.Sprintf("https_proxy=%s", proxyURL),
+		fmt.Sprintf("all_proxy=%s", proxyURL),
+		fmt.Sprintf("NO_PROXY=%s", noProxy),
+		fmt.Sprintf("no_proxy=%s", noProxy),
+	)
+	return out
 }
 
 // fetchSessionForWrap resolves the session for runWrap, either by reusing

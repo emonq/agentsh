@@ -9,12 +9,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/agentsh/agentsh/internal/config"
 	"github.com/agentsh/agentsh/internal/session"
+	"github.com/agentsh/agentsh/internal/wraphandoff"
 	"golang.org/x/sys/unix"
 )
 
@@ -81,16 +83,59 @@ func withNotifyHandoffHook(t *testing.T) chan struct{} {
 
 	called := make(chan struct{})
 	prev := startNotifyHandlerForWrapHook
-	startNotifyHandlerForWrapHook = func(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session) {
+	startNotifyHandlerForWrapHook = func(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session, cleanup func() error) error {
+		if cleanup != nil {
+			_ = cleanup()
+		}
 		if notifyFD != nil {
 			_ = notifyFD.Close()
 		}
 		close(called)
+		return nil
 	}
 	t.Cleanup(func() {
 		startNotifyHandlerForWrapHook = prev
 	})
 	return called
+}
+
+func withWrapperPIDValidationHook(t *testing.T, fn func(wrapperPID, peerPID int, peerUID uint32) error) {
+	t.Helper()
+	prev := validateWrapperPIDForNotifyHook
+	validateWrapperPIDForNotifyHook = fn
+	t.Cleanup(func() {
+		validateWrapperPIDForNotifyHook = prev
+	})
+}
+
+func TestStartNotifyHandlerForWrap_CleansUpAfterProbeFailure(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{}
+	cfg.Sandbox.Seccomp.FileMonitor.Enabled = &enabled
+	app, _ := newTestAppForWrap(t, cfg)
+
+	notifyFD, notifyW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = notifyFD.Close()
+		_ = notifyW.Close()
+	})
+
+	var cleanupCalls atomic.Int32
+	cleanup := func() error {
+		cleanupCalls.Add(1)
+		return nil
+	}
+
+	if err := startNotifyHandlerForWrap(context.Background(), notifyFD, "test-session", app, false, 999999999, nil, cleanup); err == nil {
+		t.Fatal("expected synchronous handler startup failure")
+	}
+
+	if got := cleanupCalls.Load(); got != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", got)
+	}
 }
 
 func TestAcceptNotifyFD_RejectsWrongUID(t *testing.T) {
@@ -298,6 +343,267 @@ func TestAcceptNotifyFD_AcceptsLegacyZeroUID(t *testing.T) {
 	case <-called:
 	default:
 		t.Fatal("expected notify handoff to be called")
+	}
+}
+
+func TestAcceptNotifyFD_UsesMetadataWrapperPIDForCgroupBeforeAck(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.Cgroups.Enabled = true
+	cfg.Sandbox.Network.EBPF.Enabled = true
+	app, mgr := newTestAppForWrap(t, cfg)
+	s, err := mgr.Create(t.TempDir(), "default")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	prevSetup := wrapCgroupSetupForNotifyHook
+	prevStart := startNotifyHandlerForWrapHook
+	setupCalled := make(chan int, 1)
+	startCalled := make(chan struct{})
+	wrapCgroupSetupForNotifyHook = func(ctx context.Context, a *App, s *session.Session, sessionID string, wrapperPID int) (func() error, error) {
+		setupCalled <- wrapperPID
+		return func() error { return nil }, nil
+	}
+	startNotifyHandlerForWrapHook = func(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session, cleanup func() error) error {
+		_ = notifyFD.Close()
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		close(startCalled)
+		return nil
+	}
+	withWrapperPIDValidationHook(t, func(wrapperPID, peerPID int, peerUID uint32) error {
+		return nil
+	})
+	t.Cleanup(func() {
+		wrapCgroupSetupForNotifyHook = prevSetup
+		startNotifyHandlerForWrapHook = prevStart
+	})
+
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "notify.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.acceptNotifyFD(context.Background(), listener, socketPath, s.ID, s, false, 0, false)
+	}()
+
+	conn := dialUnixConn(t, socketPath)
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pipeR.Close()
+		_ = pipeW.Close()
+	})
+
+	if err := wraphandoff.SendNotifyFD(conn, int(pipeR.Fd()), wraphandoff.Metadata{WrapperPID: 7777}); err != nil {
+		t.Fatalf("send handoff: %v", err)
+	}
+	if err := wraphandoff.ReadStatus(conn); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+
+	if got := <-setupCalled; got != 7777 {
+		t.Fatalf("cgroup setup pid = %d, want 7777", got)
+	}
+	<-startCalled
+	waitForTestDone(t, done)
+}
+
+func TestAcceptNotifyFD_RejectsMetadataPIDThatIsNotPeerChild(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.Cgroups.Enabled = true
+	cfg.Sandbox.Network.EBPF.Required = true
+	app, mgr := newTestAppForWrap(t, cfg)
+	s, err := mgr.Create(t.TempDir(), "default")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	prevSetup := wrapCgroupSetupForNotifyHook
+	setupCalled := make(chan struct{}, 1)
+	wrapCgroupSetupForNotifyHook = func(ctx context.Context, a *App, s *session.Session, sessionID string, wrapperPID int) (func() error, error) {
+		setupCalled <- struct{}{}
+		return func() error { return nil }, nil
+	}
+	t.Cleanup(func() {
+		wrapCgroupSetupForNotifyHook = prevSetup
+	})
+	called := withNotifyHandoffHook(t)
+
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "notify.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.acceptNotifyFD(context.Background(), listener, socketPath, s.ID, s, false, os.Getuid(), false)
+	}()
+
+	conn := dialUnixConn(t, socketPath)
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pipeR.Close()
+		_ = pipeW.Close()
+	})
+
+	if err := wraphandoff.SendNotifyFD(conn, int(pipeR.Fd()), wraphandoff.Metadata{WrapperPID: os.Getpid()}); err != nil {
+		t.Fatalf("send handoff: %v", err)
+	}
+	if err := wraphandoff.ReadStatus(conn); err == nil {
+		t.Fatal("expected server rejection status")
+	}
+	waitForTestDone(t, done)
+
+	select {
+	case <-setupCalled:
+		t.Fatal("cgroup setup should not run for untrusted wrapper PID metadata")
+	default:
+	}
+	select {
+	case <-called:
+		t.Fatal("notify handler should not start for untrusted wrapper PID metadata")
+	default:
+	}
+}
+
+func TestAcceptNotifyFD_RejectsMissingMetadataWhenEBPFRequired(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.Cgroups.Enabled = true
+	cfg.Sandbox.Network.EBPF.Enabled = true
+	cfg.Sandbox.Network.EBPF.Required = true
+	app, mgr := newTestAppForWrap(t, cfg)
+	s, err := mgr.Create(t.TempDir(), "default")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	called := withNotifyHandoffHook(t)
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "notify.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.acceptNotifyFD(context.Background(), listener, socketPath, s.ID, s, false, 0, false)
+	}()
+
+	conn := dialUnixConn(t, socketPath)
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pipeR.Close()
+		_ = pipeW.Close()
+	})
+
+	sendFDOverUnixConn(t, conn, int(pipeR.Fd()))
+	if err := wraphandoff.ReadStatus(conn); err == nil {
+		t.Fatal("expected server rejection status")
+	}
+
+	select {
+	case <-called:
+		t.Fatal("notify handler should not start")
+	default:
+	}
+	waitForTestDone(t, done)
+}
+
+func TestAcceptNotifyFD_RejectsWhenNotifyHandlerFailsBeforeAck(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{}
+	cfg.Sandbox.Cgroups.Enabled = true
+	cfg.Sandbox.Network.EBPF.Enabled = true
+	cfg.Sandbox.Seccomp.FileMonitor.Enabled = &enabled
+	app, mgr := newTestAppForWrap(t, cfg)
+	s, err := mgr.Create(t.TempDir(), "default")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	const missingWrapperPID = 999999999
+	prevSetup := wrapCgroupSetupForNotifyHook
+	setupCalled := make(chan int, 1)
+	var cleanupCalls atomic.Int32
+	wrapCgroupSetupForNotifyHook = func(ctx context.Context, a *App, s *session.Session, sessionID string, wrapperPID int) (func() error, error) {
+		setupCalled <- wrapperPID
+		return func() error {
+			cleanupCalls.Add(1)
+			return nil
+		}, nil
+	}
+	withWrapperPIDValidationHook(t, func(wrapperPID, peerPID int, peerUID uint32) error {
+		return nil
+	})
+	t.Cleanup(func() {
+		wrapCgroupSetupForNotifyHook = prevSetup
+	})
+
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "notify.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.acceptNotifyFD(context.Background(), listener, socketPath, s.ID, s, false, 0, false)
+	}()
+
+	conn := dialUnixConn(t, socketPath)
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pipeR.Close()
+		_ = pipeW.Close()
+	})
+
+	if err := wraphandoff.SendNotifyFD(conn, int(pipeR.Fd()), wraphandoff.Metadata{WrapperPID: missingWrapperPID}); err != nil {
+		t.Fatalf("send handoff: %v", err)
+	}
+	if err := wraphandoff.ReadStatus(conn); err == nil {
+		t.Fatal("expected server rejection status")
+	}
+	waitForTestDone(t, done)
+
+	select {
+	case got := <-setupCalled:
+		if got != missingWrapperPID {
+			t.Fatalf("cgroup setup pid = %d, want %d", got, missingWrapperPID)
+		}
+	default:
+		t.Fatal("expected cgroup setup to be called")
+	}
+	if got := cleanupCalls.Load(); got != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", got)
 	}
 }
 

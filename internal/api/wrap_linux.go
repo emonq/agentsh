@@ -14,11 +14,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	unixmon "github.com/agentsh/agentsh/internal/netmonitor/unix"
 	"github.com/agentsh/agentsh/internal/session"
 	"github.com/agentsh/agentsh/internal/signal"
+	"github.com/agentsh/agentsh/internal/wraphandoff"
 	"github.com/agentsh/agentsh/pkg/types"
 	"golang.org/x/sys/unix"
 )
@@ -55,10 +58,22 @@ func recvFDFromConn(sock *os.File) (*os.File, error) {
 	return nil, fmt.Errorf("no fd in control message")
 }
 
+func recvNotifyFDForWrap(conn *net.UnixConn) (*os.File, wrapNotifyMetadata, bool, error) {
+	notifyFD, meta, hasMeta, err := wraphandoff.RecvNotifyFD(conn)
+	if err != nil {
+		return nil, wrapNotifyMetadata{}, false, err
+	}
+	return notifyFD, wrapNotifyMetadata{WrapperPID: meta.WrapperPID}, hasMeta, nil
+}
+
+func writeNotifyStatusForWrap(w io.Writer, ok bool) error {
+	return wraphandoff.WriteStatus(w, ok)
+}
+
 // startNotifyHandlerForWrap starts the seccomp notify handler for a wrap session.
 // Unlike the exec path where the notify fd comes from a socketpair, here it comes
 // from the CLI via a Unix socket connection.
-func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session) {
+func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID string, a *App, execveEnabled bool, wrapperPID int, s *session.Session, cleanup func() error) error {
 	emitter := &notifyEmitterAdapter{store: a.store, broker: a.broker}
 
 	// Prefer session-specific policy engine (has expanded ${PROJECT_ROOT} etc.)
@@ -68,6 +83,14 @@ func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID
 	// Create execve handler if enabled
 	var execveHandler *unixmon.ExecveHandler
 	var cleanupSymlink func()
+	runCleanup := func() {
+		if cleanup == nil {
+			return
+		}
+		if err := cleanup(); err != nil {
+			slog.Warn("wrap: cgroup cleanup failed", "session_id", sessionID, "error", err)
+		}
+	}
 	if execveEnabled {
 		if h := createExecveHandler(a.cfg.Sandbox.Seccomp.Execve, sessionPolicy, a.approvals); h != nil {
 			execveHandler, _ = h.(*unixmon.ExecveHandler)
@@ -91,13 +114,13 @@ func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID
 							stubPath = abs
 						}
 					}
-					symlinkPath, cleanup, err := unixmon.CreateStubSymlink(stubPath)
+					symlinkPath, symlinkCleanup, err := unixmon.CreateStubSymlink(stubPath)
 					if err != nil {
 						slog.Warn("wrap: failed to create stub symlink, redirect will deny",
 							"error", err, "session_id", sessionID)
 					} else {
 						execveHandler.SetStubSymlinkPath(symlinkPath)
-						cleanupSymlink = cleanup
+						cleanupSymlink = symlinkCleanup
 						slog.Debug("wrap: created stub symlink",
 							"symlink", symlinkPath, "target", stubPath, "session_id", sessionID)
 					}
@@ -128,10 +151,11 @@ func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID
 						"or set sandbox.seccomp.file_monitor.enabled: false")
 				// Clean up resources that would normally be handled by the goroutine.
 				notifyFD.Close()
+				runCleanup()
 				if cleanupSymlink != nil {
 					cleanupSymlink()
 				}
-				return
+				return fmt.Errorf("wrap notify handler startup probe failed for wrapper pid %d: pvr_error=%v mem_error=%v", wrapperPID, pvrErr, memErr)
 			}
 			slog.Warn("wrap: ProcessVMReadv probe failed, monitoring may be degraded",
 				"wrapper_pid", wrapperPID, "pvr_error", pvrErr, "mem_error", memErr)
@@ -151,6 +175,9 @@ func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID
 
 	go func() {
 		defer notifyFD.Close()
+		if cleanup != nil {
+			defer runCleanup()
+		}
 		if cleanupSymlink != nil {
 			defer cleanupSymlink()
 		}
@@ -167,6 +194,7 @@ func startNotifyHandlerForWrap(ctx context.Context, notifyFD *os.File, sessionID
 		unixmon.ServeNotifyWithExecve(ctx, notifyFD, sessionID, sessionPolicy, emitter, execveHandler, fileHandler, bl)
 		slog.Info("wrap: notify handler returned", "session_id", sessionID)
 	}()
+	return nil
 }
 
 // startSignalHandlerForWrap starts the signal filter handler for a wrap session.
@@ -211,6 +239,81 @@ func (a *App) wrapInitWindows(_ context.Context, _ *session.Session, _ string, _
 type peerCreds struct {
 	PID int
 	UID uint32
+}
+
+type wrapperProcStatus struct {
+	PPid int
+	UIDs []uint32
+}
+
+func validateWrapperPIDForNotify(wrapperPID, peerPID int, peerUID uint32) error {
+	if wrapperPID <= 0 {
+		return fmt.Errorf("invalid wrapper pid %d", wrapperPID)
+	}
+	if peerPID <= 0 {
+		return fmt.Errorf("missing notify peer pid for wrapper pid %d", wrapperPID)
+	}
+	status, err := readWrapperProcStatus(wrapperPID)
+	if err != nil {
+		return err
+	}
+	if status.PPid != peerPID {
+		return fmt.Errorf("wrapper pid %d parent pid %d does not match notify peer pid %d", wrapperPID, status.PPid, peerPID)
+	}
+	for _, uid := range status.UIDs {
+		if uid == peerUID {
+			return nil
+		}
+	}
+	return fmt.Errorf("wrapper pid %d uid set %v does not include notify peer uid %d", wrapperPID, status.UIDs, peerUID)
+}
+
+func readWrapperProcStatus(pid int) (wrapperProcStatus, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return wrapperProcStatus{}, fmt.Errorf("read wrapper proc status for pid %d: %w", pid, err)
+	}
+	status, err := parseWrapperProcStatus(data)
+	if err != nil {
+		return wrapperProcStatus{}, fmt.Errorf("parse wrapper proc status for pid %d: %w", pid, err)
+	}
+	return status, nil
+}
+
+func parseWrapperProcStatus(data []byte) (wrapperProcStatus, error) {
+	var status wrapperProcStatus
+	ppidSet := false
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "PPid:":
+			ppid, err := strconv.Atoi(fields[1])
+			if err != nil {
+				return wrapperProcStatus{}, fmt.Errorf("invalid PPid %q: %w", fields[1], err)
+			}
+			status.PPid = ppid
+			ppidSet = true
+		case "Uid:":
+			status.UIDs = status.UIDs[:0]
+			for _, field := range fields[1:] {
+				uid64, err := strconv.ParseUint(field, 10, 32)
+				if err != nil {
+					return wrapperProcStatus{}, fmt.Errorf("invalid Uid %q: %w", field, err)
+				}
+				status.UIDs = append(status.UIDs, uint32(uid64))
+			}
+		}
+	}
+	if !ppidSet {
+		return wrapperProcStatus{}, errors.New("missing PPid")
+	}
+	if len(status.UIDs) == 0 {
+		return wrapperProcStatus{}, errors.New("missing Uid")
+	}
+	return status, nil
 }
 
 // getConnPeerCreds extracts the peer process credentials from a Unix connection.
