@@ -29,6 +29,15 @@ type ExecContext struct {
 	Truncated bool
 	SessionID string
 	Depth     int
+	// SessionlessPIDAttach is true when this tracee descends from a root
+	// that was attached via AttachPID without a SessionID (the
+	// attach_mode=pid path in app_ptrace_linux.go's initPtraceTracer).
+	// In that mode the wrapper/session layer governs enforcement above
+	// the tracer, so an empty SessionID at HandleExecve time is
+	// intentional, not a session-accounting bug. Handlers use this to
+	// distinguish "intentionally sessionless" from "non-empty but
+	// unknown SessionID" (which is a real bug and must fail closed).
+	SessionlessPIDAttach bool
 }
 
 // ExecResult carries the policy decision.
@@ -183,6 +192,13 @@ type TraceeState struct {
 	PendingExecStubFD      int    // fd injected for exec redirect; cleaned up on exec failure (-1 = none)
 	PendingExecSavedFD     int    // fd that was displaced by stub fd; restored on exec failure (-1 = none)
 	MemFD                  int
+	// SessionlessPIDAttach marks a tracee that descends from a root
+	// attached via AttachPID without a SessionID (the attach_mode=pid
+	// path). Propagated to children via seedChildStateFromParent so
+	// HandleExecve can distinguish "intentionally sessionless"
+	// (allow + pass-through) from "non-empty unknown SessionID"
+	// (fail-closed bug).
+	SessionlessPIDAttach bool
 }
 
 type resumeRequest struct {
@@ -312,6 +328,83 @@ func (t *Tracer) ResolveSessionID(pid int32) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// findParentByTGID returns the first tracee whose TGID matches
+// parentTGID, or nil if none. Caller must hold t.mu.
+func findParentByTGID(tracees map[int]*TraceeState, parentTGID int) *TraceeState {
+	if parentTGID <= 0 {
+		return nil
+	}
+	for _, st := range tracees {
+		if st.TGID == parentTGID {
+			return st
+		}
+	}
+	return nil
+}
+
+// seedChildStateFromParent builds a fully-seeded child TraceeState by
+// copying enforcement metadata from its parent. Mirrors what
+// handleNewChild's create-from-scratch branch does, so a child created
+// through this helper (the child-stop-before-fork-event fallback path)
+// is byte-identical in enforcement state to a child created through
+// handleNewChild.
+//
+// Used by:
+//   - handleNewChild's else branch (the normal create path) — passes
+//     suppressInitialStop=true because state is created on the parent's
+//     PTRACE_EVENT_FORK, BEFORE the child's initial SIGSTOP arrives;
+//     the upcoming stop must be swallowed.
+//   - The two handleStop()/handleEventStop() PTRACE_EVENT_STOP
+//     minimal-state fallbacks — pass suppressInitialStop=false because
+//     the child's initial stop has ALREADY been received (that's what
+//     dispatched the fallback); setting the flag here would leave it
+//     stale and silently swallow the next external SIGSTOP. Without
+//     state inheritance via this helper, the child's SessionID would
+//     stay "" until the fork event fires; if it execve's in that
+//     window, HandleExecve previously denied with EACCES, which raced
+//     ld.so on the new ELF and crashed the tracee.
+//
+// Copied (in addition to bookkeeping): SessionID, HasPrefilter,
+// PendingPrefilter (skipped when parent already has the filter installed
+// since children inherit it via fork), TGID-level escalation flags,
+// thread escalation flags, and SessionlessPIDAttach. Per-thread runtime
+// state (LastNr, MemFD, Pending*, etc.) is initialized to defaults.
+//
+// If parent is nil (parent not yet in t.tracees, e.g. attaching root
+// before any tracee exists), only the per-thread defaults are
+// populated.
+//
+// Caller must hold t.mu.
+func seedChildStateFromParent(parent *TraceeState, childTID, childTGID int, suppressInitialStop bool) *TraceeState {
+	st := &TraceeState{
+		TID:                 childTID,
+		TGID:                childTGID,
+		Attached:            time.Now(),
+		LastNr:              -1,
+		MemFD:               -1,
+		PendingExecStubFD:   -1,
+		PendingExecSavedFD:  -1,
+		SuppressInitialStop: suppressInitialStop,
+	}
+	if parent == nil {
+		return st
+	}
+	pendingPrefilter := false
+	if !parent.HasPrefilter {
+		pendingPrefilter = parent.PendingPrefilter
+	}
+	st.ParentPID = parent.TGID
+	st.SessionID = parent.SessionID
+	st.HasPrefilter = parent.HasPrefilter
+	st.PendingPrefilter = pendingPrefilter
+	st.NeedsReadEscalation = parent.NeedsReadEscalation
+	st.NeedsWriteEscalation = parent.NeedsWriteEscalation
+	st.ThreadHasReadEscalation = parent.ThreadHasReadEscalation
+	st.ThreadHasWriteEscalation = parent.ThreadHasWriteEscalation
+	st.SessionlessPIDAttach = parent.SessionlessPIDAttach
+	return st
 }
 
 // writeReadyFile writes the sentinel file if configured and not yet written.
@@ -723,23 +816,28 @@ func (t *Tracer) handleStop(ctx context.Context, tid int, status unix.WaitStatus
 				t.mu.Unlock()
 
 				// Auto-attached children may receive this stop before
-				// handleNewChild creates their state. Create minimal
-				// state and resume to avoid leaving them stuck.
+				// handleNewChild creates their state. Seed full
+				// enforcement state from the parent immediately so a
+				// child that execve's in this window has the same
+				// SessionID / prefilter / escalation flags it would
+				// have had via handleNewChild -- otherwise HandleExecve
+				// previously saw session_id="" and denied with EACCES,
+				// which raced the new ELF's startup in ld.so and
+				// crashed the tracee mid-injection.
 				if !hasState {
 					childTGID, _ := readTGID(tid)
 					if childTGID == 0 {
 						childTGID = tid
 					}
+					parentPID, _ := readPPID(tid)
 					t.mu.Lock()
 					if _, exists := t.tracees[tid]; !exists {
-						t.tracees[tid] = &TraceeState{
-							TID:                tid,
-							TGID:               childTGID,
-							LastNr:             -1,
-							MemFD:              -1,
-							PendingExecStubFD:  -1,
-							PendingExecSavedFD: -1,
-						}
+						parent := findParentByTGID(t.tracees, parentPID)
+						// suppressInitialStop=false: the child's initial
+						// SIGSTOP has already arrived (it's what dispatched
+						// us into this branch); leaving the flag true
+						// would silently swallow the next external SIGSTOP.
+						t.tracees[tid] = seedChildStateFromParent(parent, tid, childTGID, false)
 						t.metrics.SetTraceeCount(len(t.tracees))
 					}
 					t.mu.Unlock()
@@ -1376,30 +1474,20 @@ func (t *Tracer) handleNewChild(parentTID int, event int) {
 		existing.NeedsWriteEscalation = parent.NeedsWriteEscalation
 		existing.ThreadHasReadEscalation = parent.ThreadHasReadEscalation
 		existing.ThreadHasWriteEscalation = parent.ThreadHasWriteEscalation
+		// Overwrite the marker the procfs fallback may have inferred:
+		// findParentByTGID + readPPID is best-effort and can land on the
+		// wrong tracee. The kernel-authoritative parent from the fork
+		// event always wins so a stale SessionlessPIDAttach=true cannot
+		// turn HandleExecve into a silent allow for a real session bug.
+		existing.SessionlessPIDAttach = parent.SessionlessPIDAttach
 		existing.Attached = time.Now()
 	} else {
-		pendingPrefilter := false
-		if !parent.HasPrefilter {
-			pendingPrefilter = parent.PendingPrefilter
-		}
-		t.tracees[tid] = &TraceeState{
-			TID:                      tid,
-			TGID:                     childTGID,
-			ParentPID:                parent.TGID,
-			SessionID:                parent.SessionID,
-			HasPrefilter:             parent.HasPrefilter,
-			PendingPrefilter:         pendingPrefilter,
-			NeedsReadEscalation:      parent.NeedsReadEscalation,
-			NeedsWriteEscalation:     parent.NeedsWriteEscalation,
-			ThreadHasReadEscalation:  parent.ThreadHasReadEscalation,
-			ThreadHasWriteEscalation: parent.ThreadHasWriteEscalation,
-			Attached:                 time.Now(),
-			LastNr:                   -1,
-			MemFD:                    -1,
-			PendingExecStubFD:        -1,
-			PendingExecSavedFD:       -1,
-			SuppressInitialStop:      true,
-		}
+		// Shared with the two minimal-state fallback paths in
+		// handleStop()/handleEventStop() so a child created via either
+		// path is byte-identical in enforcement state. The normal-
+		// path child here is created on the parent's PTRACE_EVENT_FORK
+		// before the child's initial SIGSTOP arrives, so suppress it.
+		t.tracees[tid] = seedChildStateFromParent(parent, tid, childTGID, true)
 	}
 	t.metrics.SetTraceeCount(len(t.tracees))
 	t.mu.Unlock()
@@ -1650,21 +1738,20 @@ func (t *Tracer) handleEventStop(tid int) {
 	// Both are correctly resumed with PtraceSyscall/PtraceCont; PTRACE_LISTEN
 	// is not needed here.
 	if !hasState {
-		// Create minimal state so the child doesn't get lost.
+		// Create minimal state so the child doesn't get lost. Seed full
+		// enforcement state from the parent via seedChildStateFromParent
+		// (see the matching block higher up in handleStop() and the
+		// helper doc for the full rationale). suppressInitialStop=false
+		// because the initial stop has already been dispatched here.
 		childTGID, _ := readTGID(tid)
 		if childTGID == 0 {
 			childTGID = tid
 		}
+		parentPID, _ := readPPID(tid)
 		t.mu.Lock()
 		if _, exists := t.tracees[tid]; !exists {
-			t.tracees[tid] = &TraceeState{
-				TID:                tid,
-				TGID:               childTGID,
-				LastNr:             -1,
-				MemFD:              -1,
-				PendingExecStubFD:  -1,
-				PendingExecSavedFD: -1,
-			}
+			parent := findParentByTGID(t.tracees, parentPID)
+			t.tracees[tid] = seedChildStateFromParent(parent, tid, childTGID, false)
 			t.metrics.SetTraceeCount(len(t.tracees))
 		}
 		t.mu.Unlock()
@@ -1713,10 +1800,12 @@ func (t *Tracer) handleExecve(ctx context.Context, tid int, sc *SyscallContext) 
 	state := t.tracees[tid]
 	var tgid, parentPID int
 	var sessionID string
+	var sessionlessPIDAttach bool
 	if state != nil {
 		tgid = state.TGID
 		parentPID = state.ParentPID
 		sessionID = state.SessionID
+		sessionlessPIDAttach = state.SessionlessPIDAttach
 	}
 	t.mu.Unlock()
 
@@ -1726,13 +1815,14 @@ func (t *Tracer) handleExecve(ctx context.Context, tid int, sc *SyscallContext) 
 	depth := t.processTree.Depth(tgid)
 
 	result := t.cfg.ExecHandler.HandleExecve(ctx, ExecContext{
-		PID:       tgid,
-		ParentPID: parentPID,
-		Filename:  filename,
-		Argv:      argv,
-		Truncated: truncated,
-		SessionID: sessionID,
-		Depth:     depth,
+		PID:                  tgid,
+		ParentPID:            parentPID,
+		Filename:             filename,
+		Argv:                 argv,
+		Truncated:            truncated,
+		SessionID:            sessionID,
+		Depth:                depth,
+		SessionlessPIDAttach: sessionlessPIDAttach,
 	})
 
 	// Dispatch based on Action field (preferred) or Allow field (legacy fallback).
