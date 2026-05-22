@@ -78,6 +78,13 @@ const (
 	// generation per the WTP client design.
 	ReasonSessionUpdateGenerationInvalid ValidationReason = "session_update_generation_invalid"
 
+	// ReasonHeartbeatGenerationInvalid is returned by
+	// ValidateServerHeartbeat when the inbound ServerHeartbeat has
+	// generation == 0. Generation is REQUIRED in WTP v0.5 (issue #352);
+	// no prior server version emitted ServerHeartbeat, so there is no
+	// compat path for unset generation.
+	ReasonHeartbeatGenerationInvalid ValidationReason = "heartbeat_generation_invalid"
+
 	// ReasonPolicyPushInvalid is returned by ValidatePolicyPush when the
 	// inbound PolicyPush is nil, missing required fields, or contains
 	// invalid content hashes.
@@ -159,6 +166,7 @@ var allValidationReasons = []ValidationReason{
 	ReasonPayloadTooLarge,
 	ReasonGoawayCodeUnspecified,
 	ReasonSessionUpdateGenerationInvalid,
+	ReasonHeartbeatGenerationInvalid,
 	ReasonPolicyPushInvalid,
 	ReasonUnknown,
 }
@@ -363,13 +371,22 @@ func ValidateBatchAck(ack *BatchAck) error {
 	return nil
 }
 
-// ValidateServerHeartbeat rejects a nil ServerHeartbeat. No other
-// stateless invariants apply.
+// ValidateServerHeartbeat returns ReasonHeartbeatGenerationInvalid
+// when the inbound ServerHeartbeat has generation == 0 (issue #352:
+// generation is REQUIRED in WTP v0.5; no prior server version emitted
+// ServerHeartbeat, so there is no compat path for unset generation).
+// Returns ReasonUnknown for nil.
 func ValidateServerHeartbeat(hb *ServerHeartbeat) error {
 	if hb == nil {
 		return &ValidationError{
 			Reason: ReasonUnknown,
 			Inner:  fmt.Errorf("%w: server_heartbeat is nil", ErrInvalidFrame),
+		}
+	}
+	if hb.Generation == 0 {
+		return &ValidationError{
+			Reason: ReasonHeartbeatGenerationInvalid,
+			Inner:  fmt.Errorf("%w: server_heartbeat.generation must be > 0", ErrInvalidFrame),
 		}
 	}
 	return nil

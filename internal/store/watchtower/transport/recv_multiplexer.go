@@ -22,13 +22,10 @@ const (
 	// gen + seq are populated from the wire frame.
 	recvAckEventBatchAck recvAckEventKind = iota + 1
 	// recvAckEventHeartbeat wraps a *wtpv1.ServerMessage_ServerHeartbeat
-	// demux. Only seq is populated from the wire frame; gen is zero
-	// because the proto carries no generation field. The main goroutine
-	// substitutes t.persistedAck.Generation at apply time — safe ONLY
-	// because strict FIFO order on eventCh guarantees any earlier
-	// BatchAck has already been processed (and may have advanced
-	// t.persistedAck.Generation) before this heartbeat reaches the
-	// dispatch site. See round-22 Finding 1.
+	// demux. gen + seq are populated from the wire frame (issue #352);
+	// the discriminator distinguishes heartbeats from BatchAcks because
+	// state handlers apply different inflight/release semantics
+	// (state_live releases inflight on Adopted; state_replaying does not).
 	recvAckEventHeartbeat
 	// recvAckEventPolicyPush wraps a *wtpv1.ServerMessage_PolicyPush
 	// demux. gen + seq are unused (PolicyPush carries no ack tuple);
@@ -41,13 +38,10 @@ const (
 // pushes onto recvSession.eventCh. The kind discriminator selects the
 // dispatch on the main goroutine; gen/seq carry the ack tuple.
 //
-// Wire-ordering invariant (round-22 Finding 1, load-bearing): events on
-// eventCh are processed in strict FIFO order on the main goroutine. The
-// recv goroutine pushes them in receive order; the main goroutine
-// selects one at a time and runs applyAckFromRecv to completion before
-// pulling the next. The heartbeat-generation substitution rule (see
-// recvAckEventHeartbeat) depends on this invariant — any change to the
-// recv-event ordering MUST be reviewed against the substitution rule.
+// Wire-ordering invariant: events on eventCh are processed in strict
+// FIFO order on the main goroutine. The recv goroutine pushes them in
+// receive order; the main goroutine selects one at a time and runs
+// applyAckFromRecv to completion before pulling the next.
 type recvAckEvent struct {
 	kind recvAckEventKind
 	gen  uint32
@@ -74,9 +68,9 @@ type recvAckEvent struct {
 type recvSession struct {
 	ctx      context.Context
 	cancelFn context.CancelFunc
-	// eventCh carries demuxed BatchAck and ServerHeartbeat events in
-	// strict wire order. Depth 4 absorbs steady-state burstiness; the
-	// recv goroutine blocks on send when the channel is full and
+	// eventCh carries demuxed BatchAck, ServerHeartbeat, and PolicyPush
+	// events in strict wire order. Depth 4 absorbs steady-state burstiness;
+	// the recv goroutine blocks on send when the channel is full and
 	// unblocks via ctx cancellation. Single-channel-FIFO design per
 	// round-22 Finding 1.
 	eventCh chan recvAckEvent
@@ -272,9 +266,8 @@ func (t *Transport) runRecv(rs *recvSession) {
 			h := m.ServerHeartbeat
 			ev := recvAckEvent{
 				kind: recvAckEventHeartbeat,
-				// gen left zero; main substitutes t.persistedAck.Generation
-				// at apply time per the FIFO-order invariant.
-				seq: h.GetAckHighWatermarkSeq(),
+				gen:  h.GetGeneration(),
+				seq:  h.GetAckHighWatermarkSeq(),
 			}
 			select {
 			case rs.eventCh <- ev:

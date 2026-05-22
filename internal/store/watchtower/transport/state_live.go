@@ -231,20 +231,20 @@ func (t *Transport) runLive(ctx context.Context, rdr *wal.Reader, opts LiveOptio
 					}
 				}
 			case recvAckEventHeartbeat:
-				// Heartbeat carries no gen on the wire; FIFO order on
-				// eventCh guarantees any earlier BatchAck has already
-				// advanced t.persistedAck.Generation, so substituting
-				// here is safe (round-22 Finding 1 invariant).
-				//
 				// Heartbeats use the SAME ack clamp as BatchAck and
 				// may carry an ack advance when a BatchAck was
 				// missed (per spec). Release every covered batch on
 				// an Adopted heartbeat — otherwise the sender would
 				// wedge at MaxInflight until reconnect (roborev
 				// Medium round-4).
-				outcome := t.applyAckFromRecv("server_heartbeat", t.persistedAck.Generation, ev.seq)
+				outcome := t.applyAckFromRecv("server_heartbeat", ev.gen, ev.seq)
 				if outcome == AckOutcomeAdopted {
-					inflight.Release(t.persistedAck.Generation, ev.seq)
+					// inflight.Release uses lexicographic (gen, seq) ordering
+					// (see inflight.go:38-42), so a wire-gen heartbeat with
+					// ev.gen > pending entries' gen correctly releases the
+					// older-gen entries; same-gen at or below seq follows the
+					// existing release contract.
+					inflight.Release(ev.gen, ev.seq)
 					if err := drainAvailable(); err != nil {
 						teardownForReconnect()
 						return StateConnecting, err
