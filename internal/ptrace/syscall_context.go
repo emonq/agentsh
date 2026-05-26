@@ -12,6 +12,14 @@ import (
 // ptraceGetSyscallInfo is the ptrace request for PTRACE_GET_SYSCALL_INFO (Linux 5.3+).
 const ptraceGetSyscallInfo = 0x420e
 
+// ptrace_syscall_info op values (uapi/linux/ptrace.h, PTRACE_SYSCALL_INFO_*).
+const (
+	ptraceSyscallInfoNone    uint8 = 0
+	ptraceSyscallInfoEntry   uint8 = 1
+	ptraceSyscallInfoExit    uint8 = 2
+	ptraceSyscallInfoSeccomp uint8 = 3
+)
+
 // SyscallEntryInfo holds syscall number and arguments extracted at entry time.
 type SyscallEntryInfo struct {
 	Nr   int
@@ -73,13 +81,34 @@ func (t *Tracer) getSyscallEntryInfo(tid int) (*SyscallEntryInfo, error) {
 	if errno != 0 {
 		return nil, fmt.Errorf("PTRACE_GET_SYSCALL_INFO: %w", errno)
 	}
-	if info.Op != 1 && info.Op != 3 {
-		return nil, fmt.Errorf("PTRACE_GET_SYSCALL_INFO: unexpected op %d (want entry=1 or seccomp=3)", info.Op)
+	if info.Op != ptraceSyscallInfoEntry && info.Op != ptraceSyscallInfoSeccomp {
+		return nil, fmt.Errorf("PTRACE_GET_SYSCALL_INFO: unexpected op %d (want entry=%d or seccomp=%d)",
+			info.Op, ptraceSyscallInfoEntry, ptraceSyscallInfoSeccomp)
 	}
 	return &SyscallEntryInfo{
 		Nr:   int(info.EntryNr),
 		Args: info.EntryArgs,
 	}, nil
+}
+
+// syscallStopOp returns the PTRACE_GET_SYSCALL_INFO op for the tracee's current
+// stop (none/entry/exit/seccomp). Valid only at a ptrace syscall or seccomp
+// stop. Unlike getSyscallEntryInfo it does not reject the exit op — the inject
+// path uses it to confirm a syscall-EXIT stop before trusting the return reg.
+func (t *Tracer) syscallStopOp(tid int) (uint8, error) {
+	var info ptraceSyscallInfo
+	_, _, errno := unix.Syscall6(
+		unix.SYS_PTRACE,
+		uintptr(ptraceGetSyscallInfo),
+		uintptr(tid),
+		uintptr(ptraceSyscallInfoSize),
+		uintptr(unsafe.Pointer(&info)),
+		0, 0,
+	)
+	if errno != 0 {
+		return ptraceSyscallInfoNone, fmt.Errorf("PTRACE_GET_SYSCALL_INFO: %w", errno)
+	}
+	return info.Op, nil
 }
 
 // buildSyscallContext constructs a SyscallContext for a stopped tracee.
