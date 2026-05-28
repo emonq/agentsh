@@ -149,8 +149,8 @@ func TestReconcileProc_RunningTraceeNotFlagged(t *testing.T) {
 	tr.tracees[os.Getpid()] = &TraceeState{TID: os.Getpid()}
 
 	out := withTrace(t, true, func() {
-		tr.reconcileProc()                              // first scan records lastProcScan
-		tr.lastProcScan = time.Now().Add(-time.Second)  // bypass throttle
+		tr.reconcileProc()                             // first scan records lastProcScan
+		tr.lastProcScan = time.Now().Add(-time.Second) // bypass throttle
 		tr.reconcileProc()
 	})
 	if strings.Contains(out, "WEDGE(v2)") {
@@ -172,4 +172,89 @@ func TestReconcileProc_Throttled(t *testing.T) {
 			t.Error("reconcileProc must be throttled within procScanInterval")
 		}
 	})
+}
+
+func TestProcExists(t *testing.T) {
+	if !procExists(os.Getpid()) {
+		t.Error("procExists(self) = false, want true")
+	}
+	if procExists(1 << 30) {
+		t.Error("procExists(huge pid) = true, want false")
+	}
+}
+
+// TestRecoverVanishedTracees is the core #2 fix: a tracee that has vanished from
+// /proc (its exit was reaped out from under the tracer) is reaped via handleExit,
+// which unblocks the exec waiting on its exit-notify channel.
+func TestRecoverVanishedTracees(t *testing.T) {
+	tr := NewTracer(TracerConfig{})
+
+	const goneTID = 1 << 30 // no such pid → procExists==false
+	tr.tracees[goneTID] = &TraceeState{TID: goneTID, TGID: goneTID, MemFD: -1}
+	exitCh, err := tr.RegisterExitNotify(goneTID)
+	if err != nil {
+		t.Fatalf("RegisterExitNotify: %v", err)
+	}
+
+	// A live tracee (our own pid) must NOT be reaped.
+	livePID := os.Getpid()
+	tr.tracees[livePID] = &TraceeState{TID: livePID, TGID: livePID, MemFD: -1}
+
+	got := tr.recoverVanishedTracees()
+	if got != 1 {
+		t.Fatalf("recoverVanishedTracees() = %d, want 1 (only the vanished tracee)", got)
+	}
+
+	tr.mu.Lock()
+	_, goneStillTracked := tr.tracees[goneTID]
+	_, liveStillTracked := tr.tracees[livePID]
+	tr.mu.Unlock()
+	if goneStillTracked {
+		t.Error("vanished tracee must be removed from t.tracees")
+	}
+	if !liveStillTracked {
+		t.Error("live tracee must NOT be reaped")
+	}
+
+	// The waiter must be unblocked with ExitVanished so the exec doesn't hang.
+	select {
+	case es := <-exitCh:
+		if es.Reason != ExitVanished {
+			t.Errorf("exit notify Reason = %v, want ExitVanished", es.Reason)
+		}
+	default:
+		t.Error("recovery must signal the exit-notify channel (exec would otherwise hang)")
+	}
+}
+
+func TestRecoverVanishedTracees_NoneVanished(t *testing.T) {
+	tr := NewTracer(TracerConfig{})
+	tr.tracees[os.Getpid()] = &TraceeState{TID: os.Getpid(), TGID: os.Getpid(), MemFD: -1}
+	if got := tr.recoverVanishedTracees(); got != 0 {
+		t.Errorf("recoverVanishedTracees() = %d, want 0 when all tracees are live", got)
+	}
+}
+
+func TestEchildBackoff_Escalates(t *testing.T) {
+	// Early spins stay tight (catch transient ECHILD fast); a persistent wedge
+	// backs off and is capped so it never spins at ~200 Hz.
+	if d := echildBackoff(0); d != 5*time.Millisecond {
+		t.Errorf("echildBackoff(0) = %v, want 5ms", d)
+	}
+	if d := echildBackoff(6); d <= 5*time.Millisecond {
+		t.Errorf("echildBackoff(6) = %v, want > 5ms", d)
+	}
+	cap250 := echildBackoff(1000)
+	if cap250 != 250*time.Millisecond {
+		t.Errorf("echildBackoff(1000) = %v, want 250ms cap", cap250)
+	}
+	// Monotonic non-decreasing.
+	prev := time.Duration(0)
+	for n := 0; n <= 40; n++ {
+		d := echildBackoff(n)
+		if d < prev {
+			t.Errorf("echildBackoff(%d)=%v decreased below %v", n, d, prev)
+		}
+		prev = d
+	}
 }
