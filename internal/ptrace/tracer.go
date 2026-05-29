@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -215,6 +216,12 @@ type TraceeState struct {
 	// persists past the threshold we dump the trace ring and set procWedgeLogged.
 	procStuckSince  time.Time
 	procWedgeLogged bool
+	// listening is true while this tracee is held in PTRACE_LISTEN (a job-control
+	// group-stop the tracer is deliberately letting sit). Such tracees are
+	// legitimately stopped indefinitely, so the watchdog must NOT treat them as
+	// wedged. Set before ptraceListen, cleared when the tracee is next handled.
+	// Guarded by t.mu. (#369 #2)
+	listening bool
 }
 
 type resumeRequest struct {
@@ -306,6 +313,17 @@ type Tracer struct {
 	echildSpins   int
 	lastExitRecon time.Time
 	idleParkLog   time.Time
+	// runThreadTID is the OS thread id (gettid) the Run loop is locked to, set
+	// once at Run start. The watchdog logs it so a stop owned by a different
+	// thread than this one is visible in the dump (#369 #2).
+	runThreadTID int
+	// lastProgressNanos is updated on every dispatched stop; the watchdog only
+	// heals when it is stale (the Run loop is genuinely not progressing), so a
+	// busy-but-progressing loop never trips the killer. currentHandlingTID is
+	// the tid the Run loop is actively in handleStop for; the watchdog never
+	// heals it (avoids killing a tracee mid-handling). Both are #369 #2.
+	lastProgressNanos  atomic.Int64
+	currentHandlingTID atomic.Int64
 
 	stopped chan struct{}
 }
@@ -790,6 +808,25 @@ func (t *Tracer) applyReturnOverride(tid int, retval int64) {
 
 // handleStop dispatches a tracee stop event.
 func (t *Tracer) handleStop(ctx context.Context, tid int, status unix.WaitStatus, rusage *unix.Rusage) {
+	// #369 #2 watchdog coordination: record that the Run loop is making progress
+	// (handling a stop), mark the tid it is actively servicing so the watchdog
+	// never heals a tracee mid-handling, and clear the listening flag — any stop
+	// event means the tracee is no longer idly held in PTRACE_LISTEN. The
+	// heartbeat is refreshed on exit too (and inside the inject poll loop, see
+	// waitForSyscallStop) so a long-but-progressing handleStop never looks
+	// stale; only the idle-spin wedge (no handleStop at all) goes stale.
+	t.lastProgressNanos.Store(time.Now().UnixNano())
+	t.currentHandlingTID.Store(int64(tid))
+	defer func() {
+		t.currentHandlingTID.Store(0)
+		t.lastProgressNanos.Store(time.Now().UnixNano())
+	}()
+	t.mu.Lock()
+	if s := t.tracees[tid]; s != nil {
+		s.listening = false
+	}
+	t.mu.Unlock()
+
 	switch {
 	case status.Exited() || status.Signaled():
 		t.handleExit(tid, status, rusage, ExitNormal)
@@ -887,6 +924,11 @@ func (t *Tracer) handleStop(ctx context.Context, tid int, status unix.WaitStatus
 					break
 				}
 
+				t.mu.Lock()
+				if s := t.tracees[tid]; s != nil {
+					s.listening = true // watchdog must not treat a LISTEN'd group-stop as wedged (#369 #2)
+				}
+				t.mu.Unlock()
 				ptraceListen(tid)
 				t.traceResume(tid, "listen", 0)
 				break
@@ -1950,6 +1992,14 @@ func (t *Tracer) Run(ctx context.Context) error {
 	defer t.cancelPendingExitWaiters()
 
 	initPtraceTrace()
+	t.runThreadTID = unix.Gettid()
+	t.lastProgressNanos.Store(time.Now().UnixNano())
+
+	// External wedge watchdog (#369 #2): detects ptrace-stopped-but-unadvanced
+	// tracees by /proc ground truth from OUTSIDE this loop, and force-recovers
+	// them so a blocked exec returns instead of hanging. Runs for the lifetime
+	// of the tracer.
+	go t.runStuckTraceeWatchdog(ctx)
 
 	t.hasSyscallInfo = probePtraceSyscallInfo()
 	if t.hasSyscallInfo {
