@@ -97,7 +97,12 @@ type traceEvent struct {
 	via    string // resume site
 }
 
-const traceRingSize = 8192
+// traceRingSize holds enough events to retain well over a minute of trace under
+// sustained load. erans's rc15 capture showed the previous 8192 retained only
+// ~9s and WRAPPED before the ~35s FUSE-on cliff completed, losing the
+// terminating sequence. ~64k entries (~5MB at ~80B/event) retains ~70s, so a
+// cliff dump captures the full stall + the unblock (#369 #2).
+const traceRingSize = 65536
 
 // traceRing and traceRingIdx are written ONLY by the Run goroutine. Every append
 // site runs there: the Run-loop Wait4, handleStop and its dispatch handlers, the
@@ -107,6 +112,11 @@ const traceRingSize = 8192
 // synchronization is needed. dumpTraceRing reads them, also from the Run goroutine
 // (idle tick). The atomic on the index is solely so a future off-goroutine reader
 // could snapshot it safely.
+//
+// ASSUMPTION: a single Tracer.Run() per process. agentsh runs exactly one ptrace
+// tracer (a.ptraceTracer), so this holds. The ring is package-global (rather than
+// per-Tracer) only to keep the trace hooks call-site-light; if a second concurrent
+// Tracer.Run() is ever introduced, move this state onto Tracer to avoid a race.
 var (
 	traceRing    [traceRingSize]traceEvent
 	traceRingIdx atomic.Uint64
