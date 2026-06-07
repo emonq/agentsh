@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -17,6 +18,7 @@ import (
 	"github.com/agentsh/agentsh/internal/envinject"
 	"github.com/agentsh/agentsh/internal/wrapenv"
 	"github.com/agentsh/agentsh/internal/wraphandoff"
+	"github.com/agentsh/agentsh/internal/wrapperlog"
 	"github.com/agentsh/agentsh/pkg/types"
 	"golang.org/x/sys/unix"
 )
@@ -160,6 +162,29 @@ func platformSetupWrap(ctx context.Context, wrapResp types.WrapInitResponse, ses
 	extraFiles := []*os.File{childFile}
 	if hasSignalSocket {
 		extraFiles = append(extraFiles, signalChildFile)
+	}
+
+	// Wrapper log routing (issue #415): the CLI's stderr is the user's
+	// terminal, so route wrapper diagnostics to the state-dir log file.
+	// fd number = next ExtraFiles slot (4, or 5 with the signal socket).
+	// Debug-level fallback note on open failure — a Warn would reintroduce
+	// the exact noise this removes. wrap.go closes every extraFiles entry
+	// after Start, so no extra cleanup is needed.
+	// os.Getenv returns the FIRST duplicate, so drop any copy of the
+	// key carried in by the inherited environment, env_inject, or
+	// server WrapperEnv. Unconditional: even on open failure a stale
+	// value must not survive — inside the wrapper it could name a
+	// valid-but-unrelated fd (e.g. the signal socket at fd 4) and
+	// receive routed diagnostics.
+	env = stripEnvKey(env, wrapperlog.EnvKey)
+	logFile, logErr := wrapperlog.OpenStateLogFile()
+	if logErr != nil {
+		// Debug, not Warn: the CLI's stderr is the user's terminal and
+		// the wrapper falls back to it anyway (legacy behavior).
+		slog.Debug("wrap: wrapper log file unavailable; wrapper diagnostics stay on stderr", "error", logErr)
+	} else {
+		env = append(env, fmt.Sprintf("%s=%d", wrapperlog.EnvKey, 3+len(extraFiles)))
+		extraFiles = append(extraFiles, logFile)
 	}
 
 	return &wrapLaunchConfig{
@@ -320,4 +345,19 @@ func isTerminal(fd uintptr) bool {
 func reclaimTerminal() {
 	pgid := int32(unix.Getpgrp())
 	_, _, _ = unix.Syscall(unix.SYS_IOCTL, os.Stdin.Fd(), unix.TIOCSPGRP, uintptr(unsafe.Pointer(&pgid)))
+}
+
+// stripEnvKey returns env without any KEY=... entries for key.
+// WARNING: filters in place via env[:0] — it mutates the input slice's
+// backing array, so callers must pass a slice they exclusively own.
+func stripEnvKey(env []string, key string) []string {
+	out := env[:0]
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
