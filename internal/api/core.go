@@ -1306,6 +1306,59 @@ func (a *App) mountFUSEForSession(ctx context.Context, p fuseMountParams) bool {
 		}
 	}
 
+	// Configure content capture.
+	var contentStore *ContentStore
+	if cc := a.cfg.Sandbox.FUSE.Audit.ContentCapture; cc != nil && cc.Enabled {
+		maxSize := cc.MaxFileSize
+		if maxSize <= 0 {
+			maxSize = 1 << 20 // default 1MB
+		}
+		storageDir := cc.StorageDir
+		if storageDir == "" {
+			storageDir = filepath.Join(mountBase, s.ID, "content")
+		}
+		captureReads := cc.CaptureReads == nil || *cc.CaptureReads
+		captureWrites := cc.CaptureWrites == nil || *cc.CaptureWrites
+		contentStore = NewContentStore(storageDir, maxSize)
+		if err := contentStore.Init(); err != nil {
+			slog.Error("init content store", "error", err, "dir", storageDir)
+			contentStore = nil
+		} else {
+			fsCfg.ContentCapture = func(path string, op platform.FileOperation, content []byte, offset int64) {
+				if op == platform.FileOpRead && !captureReads {
+					return
+				}
+				if op == platform.FileOpWrite && !captureWrites {
+					return
+				}
+				contentID, truncated, err := contentStore.Capture(path, op, content, offset)
+				if err != nil {
+					slog.Debug("content capture failed", "error", err, "path", path)
+					return
+				}
+				if contentID != "" {
+					select {
+					case eventChan <- platform.IOEvent{
+						Timestamp: time.Now(),
+						SessionID: s.ID,
+						Type:      platform.EventType("file_" + string(op)),
+						Path:      path,
+						Operation: op,
+						Decision:  platform.DecisionAllow,
+						Metadata: map[string]any{
+							"content_id":        contentID,
+							"content_size":      len(content),
+							"content_offset":    offset,
+							"content_truncated": truncated,
+						},
+					}:
+					default:
+					}
+				}
+			}
+		}
+	}
+
 	m, err := fs.Mount(fsCfg)
 	if err != nil {
 		// Mount failed: no FUSE server is attached to eventChan, so the
@@ -1342,6 +1395,9 @@ func (a *App) mountFUSEForSession(ctx context.Context, p fuseMountParams) bool {
 	capturedMountPoint := mountPoint
 	s.SetWorkspaceUnmount(func() error {
 		deregisterFUSEMount(sessionID, capturedMountPoint)
+		if contentStore != nil {
+			_ = contentStore.Close()
+		}
 		err := m.Close()
 		close(eventChan)
 		return err

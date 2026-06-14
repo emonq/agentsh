@@ -125,6 +125,10 @@ type FSConfig struct {
 	// Plumbed from policies.symlink_escape: "deny" | "evaluate".
 	SymlinkEscapeDeny bool
 
+	// ContentCapture is invoked after Read/Write I/O completes with the
+	// actual file content. When nil, content capture is disabled.
+	ContentCapture func(path string, operation FileOperation, content []byte, offset int64)
+
 	// Options contains platform-specific mount options
 	Options map[string]string
 }

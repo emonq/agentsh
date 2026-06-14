@@ -230,6 +230,11 @@ func (f *fuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 	if err != nil && n == 0 {
 		return toErrno(err)
 	}
+
+	if f.cfg.ContentCapture != nil && n > 0 {
+		f.cfg.ContentCapture(openFile.realPath, platform.FileOpRead, buff[:n], ofst)
+	}
+
 	return n
 }
 
@@ -246,6 +251,10 @@ func (f *fuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 		return -fuse.EACCES
 	}
 	f.emitEvent("file_write", openFile.virtPath, platform.FileOpWrite, decision, false)
+
+	if f.cfg.ContentCapture != nil {
+		f.cfg.ContentCapture(openFile.realPath, platform.FileOpWrite, buff, ofst)
+	}
 
 	n, err := openFile.file.WriteAt(buff, ofst)
 	if err != nil {

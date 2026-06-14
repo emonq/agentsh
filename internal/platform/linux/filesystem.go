@@ -270,6 +270,7 @@ func (fs *Filesystem) Mount(cfg platform.FSConfig) (platform.FSMount, error) {
 		TraceContextFunc:  cfg.TraceContextFunc,
 		MaxBackground:     cfg.MaxBackground,
 		SymlinkEscapeDeny: cfg.SymlinkEscapeDeny,
+		ContentCapture:    cfg.ContentCapture,
 	}
 
 	// Set up trash/soft-delete if configured. The audit Mode reflects the

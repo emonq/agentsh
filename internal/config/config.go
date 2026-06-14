@@ -424,14 +424,23 @@ type SandboxFUSEConfig struct {
 }
 
 type FUSEAuditConfig struct {
-	Enabled              *bool  `yaml:"enabled"`
-	Mode                 string `yaml:"mode"` // monitor, soft_block, soft_delete, strict
-	TrashPath            string `yaml:"trash_path"`
-	TTL                  string `yaml:"ttl"`
-	Quota                string `yaml:"quota"`
-	StrictOnAuditFailure bool   `yaml:"strict_on_audit_failure"`
-	MaxEventQueue        int    `yaml:"max_event_queue"`
-	HashSmallFilesUnder  string `yaml:"hash_small_files_under"`
+	Enabled              *bool                   `yaml:"enabled"`
+	Mode                 string                  `yaml:"mode"` // monitor, soft_block, soft_delete, strict
+	TrashPath            string                  `yaml:"trash_path"`
+	TTL                  string                  `yaml:"ttl"`
+	Quota                string                  `yaml:"quota"`
+	StrictOnAuditFailure bool                    `yaml:"strict_on_audit_failure"`
+	MaxEventQueue        int                     `yaml:"max_event_queue"`
+	HashSmallFilesUnder  string                  `yaml:"hash_small_files_under"`
+	ContentCapture       *ContentCaptureConfig   `yaml:"content_capture,omitempty"`
+}
+
+type ContentCaptureConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	MaxFileSize   int64  `yaml:"max_file_size"`    // max bytes to capture per file (default 1MB)
+	CaptureReads  *bool  `yaml:"capture_reads"`    // default true when nil
+	CaptureWrites *bool  `yaml:"capture_writes"`   // default true when nil
+	StorageDir    string `yaml:"storage_dir"`      // directory for content files (default: <session_dir>/content)
 }
 
 type SandboxNetworkConfig struct {
@@ -1489,6 +1498,7 @@ var knownFUSEKeys = map[string]struct{}{
 	"deferred_marker_file":    {},
 	"deferred_enable_command": {},
 	"max_background":          {},
+	"content_capture":         {},
 }
 
 // unknownFUSEKeys returns keys present under sandbox.fuse that are not

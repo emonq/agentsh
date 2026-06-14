@@ -15,6 +15,7 @@ import (
 
 	"github.com/agentsh/agentsh/internal/approvals"
 	"github.com/agentsh/agentsh/internal/pathutil"
+	"github.com/agentsh/agentsh/internal/platform"
 	"github.com/agentsh/agentsh/internal/policy"
 	"github.com/agentsh/agentsh/internal/session"
 	"github.com/agentsh/agentsh/internal/trash"
@@ -40,6 +41,7 @@ type Hooks struct {
 	VirtualRoot       string // "/workspace" or real path
 	MaxBackground     int
 	SymlinkEscapeDeny bool
+	ContentCapture    func(path string, operation platform.FileOperation, content []byte, offset int64)
 }
 
 func NewMonitoredLoopbackRoot(realRoot string, hooks *Hooks) (fs.InodeEmbedder, error) {
@@ -370,7 +372,15 @@ func (f *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	}
 	f.n.emitFileEvent(ctx, "file_read", f.virtPath, "read", int64(len(dest)), dec, false, nil)
 	if r, ok := f.inner.(fs.FileReader); ok {
-		return r.Read(ctx, dest, off)
+		res, errno := r.Read(ctx, dest, off)
+		if errno == 0 && f.n.hooks.ContentCapture != nil {
+			if data, status := res.Bytes(dest); status == 0 && len(data) > 0 {
+				if real, rpErr := f.n.realPath(f.virtPath, true); rpErr == nil {
+					f.n.hooks.ContentCapture(real, platform.FileOpRead, data, off)
+				}
+			}
+		}
+		return res, errno
 	}
 	return nil, syscall.ENOSYS
 }
@@ -386,6 +396,11 @@ func (f *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 	var errno syscall.Errno
 	if w, ok := f.inner.(fs.FileWriter); ok {
 		nwritten, errno = w.Write(ctx, data, off)
+		if errno == 0 && f.n.hooks.ContentCapture != nil {
+			if real, err := f.n.realPath(f.virtPath, true); err == nil {
+				f.n.hooks.ContentCapture(real, platform.FileOpWrite, data[:nwritten], off)
+			}
+		}
 	} else {
 		errno = syscall.ENOSYS
 	}

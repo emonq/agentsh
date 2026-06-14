@@ -1,0 +1,21 @@
+# Dockerfile.dev — dev/build image with FUSE, seccomp, and pkg-config preinstalled.
+# Used for local builds and tests on hosts without those libs (e.g. macOS dev box).
+#
+# Build:
+#   docker build -f Dockerfile.dev -t agentsh-dev .
+#
+# Use:
+#   docker run --rm -v "$PWD":/app -w /app agentsh-dev go build ./...
+#   docker run --rm -v "$PWD":/app -w /app agentsh-dev go test ./...
+
+FROM golang:1.25-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libfuse-dev \
+        libseccomp-dev \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
